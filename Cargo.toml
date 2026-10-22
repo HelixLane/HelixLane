@@ -1,0 +1,11 @@
+[package]
+name = "helixlane"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "HelixLane desktop application built with Rust and GPUI Kit"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+gpui-kit = "0.8.0"
