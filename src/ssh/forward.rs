@@ -278,7 +278,11 @@ async fn run_forward(
     Ok(())
 }
 async fn socks_reply(stream: &mut TcpStream, code: u8) -> std::io::Result<()> {
-    stream.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await
+    stream.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+    if code != 0 {
+        stream.shutdown().await?;
+    }
+    Ok(())
 }
 async fn socks_request(stream: &mut TcpStream) -> Result<Destination, String> {
     let mut greeting = [0; 2];
@@ -310,10 +314,6 @@ async fn socks_request(stream: &mut TcpStream) -> Result<Destination, String> {
     if request[0] != 5 || request[2] != 0 {
         let _ = socks_reply(stream, 1).await;
         return Err("Invalid SOCKS request".into());
-    }
-    if request[1] != 1 {
-        let _ = socks_reply(stream, 7).await;
-        return Err("Only SOCKS CONNECT is supported".into());
     }
     let host = match request[3] {
         1 => {
@@ -353,9 +353,65 @@ async fn socks_request(stream: &mut TcpStream) -> Result<Destination, String> {
         .read_u16()
         .await
         .map_err(|_| "Incomplete SOCKS port")?;
+    // Consume the complete bounded address/port frame before refusing a known
+    // command. Closing with that input unread can reset the TCP connection and
+    // lose the rejection reply on Windows. Parsing performs no DNS or egress.
+    if request[1] != 1 {
+        let _ = socks_reply(stream, 7).await;
+        return Err("Only SOCKS CONNECT is supported".into());
+    }
     if host.is_empty() || host.chars().any(char::is_control) || port == 0 {
         let _ = socks_reply(stream, 1).await;
         return Err("Invalid SOCKS destination".into());
     }
     Ok(Destination { host, port })
+}
+
+#[cfg(test)]
+mod socks_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsupported_socks_commands_consume_the_bounded_request_before_reply() {
+        for (command, kind, body) in [
+            (2, 1, vec![127, 0, 0, 1, 0, 80]),
+            (
+                3,
+                4,
+                vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 80],
+            ),
+            (2, 3, b"\x0cno-such.test\0\x50".to_vec()),
+        ] {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (mut server, _) = listener.accept().await.unwrap();
+                let task = tokio::spawn(async move { socks_request(&mut server).await });
+                client.write_all(&[5, 1, 0]).await.unwrap();
+                let mut greeting = [0; 2];
+                client.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 0]);
+                client.write_all(&[5, command, 0, kind]).await.unwrap();
+                let mut reply = [0; 10];
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), client.read_exact(&mut reply))
+                        .await
+                        .is_err(),
+                    "unsupported command replied before consuming its address and port"
+                );
+                client.write_all(&body).await.unwrap();
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply, [5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
+                assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+                assert_eq!(
+                    task.await.unwrap().unwrap_err(),
+                    "Only SOCKS CONNECT is supported"
+                );
+            })
+            .await
+            .unwrap();
+        }
+    }
 }

@@ -942,12 +942,26 @@ fn socks_rejects_bind_auth_and_occupied_channel_without_disrupting_stream() {
             request.extend(echo_port.to_be_bytes());
             tcp.write_all(&request).await.unwrap();
             let mut reply = [0; 10];
-            tcp.read_exact(&mut reply).await.unwrap();
-            assert_eq!(reply[1], expected);
+            tokio::time::timeout(Duration::from_secs(2), tcp.read_exact(&mut reply))
+                .await
+                .unwrap_or_else(|_| panic!("SOCKS command {command}, reply {expected} timed out"))
+                .unwrap_or_else(|e| panic!("SOCKS command {command}, reply {expected}: {e}"));
+            assert_eq!(reply, [5, expected, 0, 1, 0, 0, 0, 0, 0, 0]);
             if expected == 0 {
                 roundtrip(&mut tcp).await;
                 held = Some(tcp);
                 assert!(session.open_channel().await.is_err());
+            } else {
+                let mut byte = [0];
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap_or_else(|e| panic!(
+                            "SOCKS command {command} reset after reply: {e}"
+                        )),
+                    0
+                );
             }
         }
         roundtrip(held.as_mut().unwrap()).await;

@@ -179,11 +179,16 @@ fn serve(
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }
-            let next = match pipe(&name, &sid, false) {
-                Ok(next) => next,
-                Err(_) => {
+            let deadline = std::time::Instant::now() + DEADLINE;
+            // Dropping Tokio's pipe owner can leave its OS instance alive until
+            // cancelled overlapped I/O completes. Retain this accepted client
+            // while ERROR_PIPE_BUSY clears; logical permits alone do not prove
+            // that CreateNamedPipe has room. Other errors never enter a retry.
+            let next = match retry::open_until(deadline, || pipe(&name, &sid, false)).await {
+                Ok(Some(next)) => next,
+                _ => {
                     // Keep the owned instance as the listener if replacement
-                    // creation fails. A transient OS limit must not kill IPC.
+                    // creation fails or this transaction's deadline expires.
                     let _ = current.disconnect();
                     drop(slot);
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -193,7 +198,12 @@ fn serve(
             let mut connected = std::mem::replace(&mut current, next);
             let queue = queue.clone();
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(DEADLINE, receive(&mut connected, &queue)).await;
+                // Replacement wait and frame/ack share one absolute budget.
+                let _ = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    receive(&mut connected, &queue),
+                )
+                .await;
                 admission::release(connected, slot);
             });
         }
@@ -276,6 +286,104 @@ mod tests {
                 super::super::super::Target::Focus
             ));
             assert!(!task.is_finished());
+            task.abort();
+        });
+    }
+
+    #[test]
+    fn accepted_request_survives_delayed_pipe_instance_release() {
+        let (sid, name) = identity().unwrap();
+        let name = format!("{name}-delayed-release-{}", std::process::id());
+        let (queue, requests) = sync_channel(QUEUE_CAPACITY);
+        crate::tasks::runtime().block_on(async {
+            let first = pipe(&name, &sid, true).unwrap();
+            // Connect to the primary before occupying the remaining instances.
+            // These handles model OS instances retained by pending I/O after a
+            // transaction's Rust value and logical permit have been dropped.
+            let mut client = ClientOptions::new().open(&name).unwrap();
+            verify_server(&client, &sid).unwrap();
+            let held: Vec<_> = (0..QUEUE_CAPACITY)
+                .map(|_| pipe(&name, &sid, false).unwrap())
+                .collect();
+            assert_eq!(
+                pipe(&name, &sid, false).unwrap_err().raw_os_error(),
+                Some(231)
+            );
+            let task = serve(first, name.clone(), sid.clone(), queue);
+            let request = OpenRequest::focus();
+            let mut sending = Box::pin(write_request(&mut client, &request));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut sending)
+                    .await
+                    .is_err(),
+                "a busy replacement must retain the accepted request"
+            );
+            assert!(requests.try_recv().is_err());
+            assert!(!task.is_finished());
+            // First-instance ownership must remain continuous while busy.
+            assert_eq!(pipe(&name, &sid, true).unwrap_err().raw_os_error(), Some(5));
+            drop(held);
+            tokio::time::timeout(DEADLINE, sending)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                requests.try_recv().unwrap().target,
+                super::super::super::Target::Focus
+            ));
+            assert!(!task.is_finished());
+            task.abort();
+        });
+    }
+
+    #[test]
+    fn replacement_wait_and_frame_share_the_original_deadline() {
+        let (sid, name) = identity().unwrap();
+        let name = format!("{name}-replacement-deadline-{}", std::process::id());
+        let (queue, requests) = sync_channel(QUEUE_CAPACITY);
+        crate::tasks::runtime().block_on(async {
+            let first = pipe(&name, &sid, true).unwrap();
+            let mut client = ClientOptions::new().open(&name).unwrap();
+            verify_server(&client, &sid).unwrap();
+            let held: Vec<_> = (0..QUEUE_CAPACITY)
+                .map(|_| pipe(&name, &sid, false).unwrap())
+                .collect();
+            let start = std::time::Instant::now();
+            let task = serve(first, name.clone(), sid.clone(), queue);
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            drop(held);
+            // No request bytes follow. A new two-second timeout after creating
+            // the replacement would incorrectly extend this connection to 3.5s.
+            let closed = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(start + DEADLINE + Duration::from_millis(900)),
+                client.read_u8(),
+            )
+            .await;
+            assert!(start.elapsed() >= DEADLINE - Duration::from_millis(200));
+            let error = closed
+                .expect("replacement reset the transaction deadline")
+                .unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::UnexpectedEof
+            ));
+            assert!(requests.try_recv().is_err());
+            assert!(!task.is_finished());
+            let mut next = retry::open_until(std::time::Instant::now() + DEADLINE, || {
+                ClientOptions::new().open(&name)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            verify_server(&next, &sid).unwrap();
+            tokio::time::timeout(DEADLINE, write_request(&mut next, &OpenRequest::focus()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                requests.try_recv().unwrap().target,
+                super::super::super::Target::Focus
+            ));
             task.abort();
         });
     }

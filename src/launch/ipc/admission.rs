@@ -1,4 +1,4 @@
-//! A transaction owns its capacity until the associated OS connection is closed.
+//! A transaction owns logical capacity until its connection owner is dropped.
 use std::{io, sync::Arc};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub(super) async fn reserve(slots: &Arc<Semaphore>) -> io::Result<OwnedSemaphorePermit> {
@@ -9,6 +9,8 @@ pub(super) async fn reserve(slots: &Arc<Semaphore>) -> io::Result<OwnedSemaphore
         .map_err(|_| io::Error::other("Transaction capacity unavailable"))
 }
 pub(super) fn release<S>(connection: S, permit: OwnedSemaphorePermit) {
+    // An async OS driver may retain its handle until pending I/O completes.
+    // Callers must still handle physical instance limits when replacing it.
     drop(connection);
     drop(permit);
 }
@@ -49,7 +51,7 @@ mod tests {
         assert_eq!(slots.available_permits(), super::super::QUEUE_CAPACITY);
     }
     #[tokio::test]
-    async fn connection_is_closed_before_capacity_is_released() {
+    async fn connection_owner_is_dropped_before_capacity_is_released() {
         struct Connection {
             slots: Arc<Semaphore>,
             closed: Arc<std::sync::atomic::AtomicBool>,

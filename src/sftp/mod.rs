@@ -499,6 +499,14 @@ mod transfer_path_tests {
             transfer_leaf(r"C:\Users\me\file.txt", true, false).unwrap(),
             "file.txt"
         );
+        for path in [
+            r"\\?\C:\Users\me\file.txt",
+            r"\\server\share\file.txt",
+            r"\\?\UNC\server\share\file.txt",
+            "C:/Users/me/file.txt",
+        ] {
+            assert_eq!(source_leaf(path, true).unwrap(), "file.txt");
+        }
         assert_eq!(
             transfer_leaf(r"/home/name\with-backslash", false, false).unwrap(),
             r"name\with-backslash"

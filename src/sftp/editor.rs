@@ -84,13 +84,31 @@ impl EditLease {
         // TransferSpec captures canonical source paths. All local fingerprints
         // must use that same identity, including the immutable upload snapshot.
         let root = std::fs::canonicalize(root).map_err(err)?;
+        // Local Windows paths may be drive/UNC/verbatim paths; remote paths are
+        // POSIX. Only the endpoint's leaf belongs in the private copy's name.
+        // POSIX leaves may also contain characters forbidden on Windows. Keep
+        // the copy portable and bounded; its name never changes the target.
+        let name: String = endpoint
+            .basename(&remote)?
+            .chars()
+            .take(48)
+            .map(|c| {
+                if c.is_control()
+                    || matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+                {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
         let local = root.join(format!(
             "edit-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
-            remote.rsplit('/').next().unwrap_or("file")
+            name.trim_end_matches(['.', ' '])
         ));
         let input = endpoint.reader(&remote).await?;
         let (bytes, mut pending) = copy_to_temporary(input, &local).await?;
@@ -244,6 +262,47 @@ impl EditorManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_editor_names_are_portable_without_changing_source_identity() {
+        let root =
+            std::env::temp_dir().join(format!("helixlane-edit-portable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        // These are legal POSIX source names, including a literal Windows path.
+        // The private copy must still be one portable filename on every host.
+        for name in [
+            r"\\?\C:\Users\me\remote.txt",
+            "report:final?.txt",
+            "trailing. ",
+        ] {
+            let original = root.join(name);
+            std::fs::write(&original, b"source bytes").unwrap();
+            let lease = EditLease::download(
+                Endpoint::Local,
+                original.display().to_string(),
+                &root.join("edits"),
+            )
+            .await
+            .unwrap();
+            let local_name = lease.local.file_name().unwrap().to_str().unwrap();
+            assert!(
+                validate_child_name(local_name, true).is_ok(),
+                "private editor filename is not portable: {local_name}"
+            );
+            assert_eq!(
+                lease.local.parent().unwrap(),
+                root.join("edits").canonicalize().unwrap()
+            );
+            assert_eq!(
+                lease.remote,
+                original.canonicalize().unwrap().display().to_string()
+            );
+            assert_eq!(std::fs::read(&lease.local).unwrap(), b"source bytes");
+            assert!(!lease.saved().await.unwrap());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn aliased_temporary_parent_keeps_two_confirmed_saves_clean() {

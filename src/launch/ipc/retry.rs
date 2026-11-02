@@ -42,7 +42,7 @@ mod tests {
         .unwrap();
         assert_eq!(result, Some(42));
         assert_eq!(n, 3);
-        for code in [2, 5, 9999] {
+        for code in [2, 5, 232, 9999] {
             let mut n = 0;
             let result = open_until::<()>(until, || {
                 n += 1;
