@@ -297,6 +297,8 @@ mod tests {
         let (queue, requests) = sync_channel(QUEUE_CAPACITY);
         crate::tasks::runtime().block_on(async {
             let first = pipe(&name, &sid, true).unwrap();
+            // Validate ownership before full capacity can mask the guard error.
+            assert_eq!(pipe(&name, &sid, true).unwrap_err().raw_os_error(), Some(5));
             // Connect to the primary before occupying the remaining instances.
             // These handles model OS instances retained by pending I/O after a
             // transaction's Rust value and logical permit have been dropped.
@@ -305,6 +307,7 @@ mod tests {
             let held: Vec<_> = (0..QUEUE_CAPACITY)
                 .map(|_| pipe(&name, &sid, false).unwrap())
                 .collect();
+            // Separately verify that all physical pipe instances are occupied.
             assert_eq!(
                 pipe(&name, &sid, false).unwrap_err().raw_os_error(),
                 Some(231)
@@ -320,8 +323,6 @@ mod tests {
             );
             assert!(requests.try_recv().is_err());
             assert!(!task.is_finished());
-            // First-instance ownership must remain continuous while busy.
-            assert_eq!(pipe(&name, &sid, true).unwrap_err().raw_os_error(), Some(5));
             drop(held);
             tokio::time::timeout(DEADLINE, sending)
                 .await
