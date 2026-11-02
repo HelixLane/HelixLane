@@ -3,11 +3,12 @@
 from pathlib import Path
 import hashlib
 import json
+from vendor_provenance import index_vendor_files
 
 root = Path(__file__).resolve().parent.parent
 expected = json.loads((root / "vendor/gpui-shell-upstream-sha256.json").read_text())
 package = root / "vendor/gpui-shell"
-actual = {str(p.relative_to(package)): p for p in package.rglob("*") if p.is_file()}
+actual = index_vendor_files(package)
 assert actual.keys() == expected.keys(), "Vendor file set differs from published package"
 insertions = [
     b"    deny_default_env: bool,\n",
