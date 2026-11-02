@@ -985,3 +985,43 @@ fn explicit_disconnect_from_reused_pty_tears_down_shared_transport() {
     });
     let _ = std::fs::remove_file(path);
 }
+#[test]
+fn incomplete_socks_handshake_expires_without_occupying_an_ssh_channel() {
+    let path = path("socks-timeout");
+    let service = Service::new(path.clone());
+    service.runtime.block_on(async {
+        let (port, server) = peer("correct", false).await;
+        let mut p = profile(port);
+        p.transport_policy = crate::workspace::TransportPolicy::SingleChannel;
+        let session = service.connect_transport(p, Secret::new("correct".into()), false);
+        wait(&session, |s| matches!(s.status, Status::HostKey { .. })).await;
+        session.trust(true);
+        wait(&session, |s| s.status == Status::Connected).await;
+        let job = service.forward(
+            session.clone(),
+            forward::ForwardSpec::Socks {
+                bind: forward::ForwardSpec::loopback(0),
+            },
+        );
+        let address = listening(&job).await;
+        let mut tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        tcp.write_all(&[5]).await.unwrap();
+        // A slow client has not requested a destination and must not reserve SSH capacity.
+        drop(session.open_channel().await.unwrap());
+        let mut byte = [0];
+        let closed = tokio::time::timeout(Duration::from_secs(17), tcp.read(&mut byte))
+            .await
+            .expect("incomplete SOCKS handshake exceeded its 15-second deadline");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        assert_eq!(
+            *job.status.lock().unwrap(),
+            forward::ForwardStatus::Listening(address)
+        );
+        drop(session.open_channel().await.unwrap());
+        job.stop();
+        stopped(&job).await;
+        session.disconnect();
+        server.abort();
+    });
+    let _ = std::fs::remove_file(path);
+}
