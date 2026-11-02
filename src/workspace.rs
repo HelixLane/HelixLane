@@ -150,6 +150,9 @@ use serde::{Deserialize, Serialize};
 pub type ResourceId = u64;
 pub type ViewId = u64;
 pub type WindowId = u64;
+fn window_open_default() -> bool {
+    true
+}
 fn default_top_height() -> f32 {
     180.
 }
@@ -158,6 +161,8 @@ fn primary_window() -> WindowId {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WorkspaceWindow {
+    #[serde(default = "window_open_default")]
+    pub open: bool,
     #[serde(default)]
     pub bounds: Option<[f32; 4]>,
     #[serde(default = "default_top_height")]
@@ -273,8 +278,18 @@ pub enum Location {
     Bottom,
     Services,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ViewPageState {
+    pub resource: Option<ResourceId>,
+    pub local_path: Option<String>,
+    pub remote_path: Option<String>,
+    pub local_scroll: [f32; 2],
+    pub remote_scroll: [f32; 2],
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ViewInstance {
+    #[serde(default)]
+    pub page: ViewPageState,
     #[serde(default = "primary_window")]
     pub window_id: WindowId,
     #[serde(skip)]
@@ -411,6 +426,7 @@ impl Workspace {
     pub fn ensure_windows(&mut self) {
         if self.window(1).is_none() {
             self.windows.push(WorkspaceWindow {
+                open: true,
                 bounds: None,
                 top_height: default_top_height(),
                 id: 1,
@@ -431,6 +447,7 @@ impl Workspace {
             .and_then(|id| self.window_target(id))
             .or(self.active_resource);
         self.windows.push(WorkspaceWindow {
+            open: true,
             bounds: None,
             top_height: default_top_height(),
             id,
@@ -486,7 +503,7 @@ impl Workspace {
         }
     }
     pub fn set_source(&mut self, window: WindowId, source: WindowId) -> bool {
-        if self.window(source).is_none() {
+        if self.window(source).is_none_or(|w| !w.open) {
             return false;
         }
         let mut cursor = Some(source);
@@ -546,12 +563,17 @@ impl Workspace {
         id
     }
     pub fn move_to_window(&mut self, id: ViewId, destination: WindowId, location: Location) {
+        let before = self.follow_targets();
+        let source = self.owner(id);
         let actual = self.target(id);
         let content = self
             .views
             .iter()
             .any(|v| v.id == id && matches!(v.tool, ToolKind::Terminal | ToolKind::Sftp));
-        if content && let Some(resource) = actual {
+        if content
+            && source != Some(destination)
+            && let Some(resource) = actual
+        {
             if let Some(w) = self.windows.iter_mut().find(|w| w.id == destination) {
                 w.source = None;
                 w.follow_paused = false;
@@ -573,6 +595,7 @@ impl Workspace {
                 w.layout.add(id);
             }
         }
+        self.invalidate_changed_targets(before);
     }
     pub fn split_in(&mut self, window: WindowId, id: ViewId, vertical: bool) {
         if window == 1 {
@@ -610,7 +633,10 @@ impl Workspace {
                 break;
             }
         }
-        self.windows.retain(|w| w.id != id);
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            w.open = false;
+            w.active_resource = last;
+        }
         self.invalidate_changed_targets(before);
     }
     pub fn unmounted_views(
@@ -642,6 +668,7 @@ impl Workspace {
         let id = self.next_id;
         self.next_id += 1;
         self.views.push(ViewInstance {
+            page: ViewPageState::default(),
             window_id: 1,
             ephemeral: false,
             id,
@@ -893,5 +920,32 @@ mod content_focus_tests {
         assert_eq!(w.target(follower), Some(1));
         assert!(!w.accepts(old));
         assert_eq!(w.ticket(fixed), fixed_ticket);
+    }
+}
+
+#[cfg(test)]
+mod background_window_tests {
+    use super::*;
+    #[test]
+    fn closing_keeps_background_target_and_hiding_does_not_publish_context() {
+        let mut w = Workspace::default();
+        let other = w.create_window(None);
+        let following = w.open_in(1, ToolKind::Sftp, TargetMode::Follow);
+        let fixed = w.open_in(1, ToolKind::Sftp, TargetMode::Fixed(3));
+        w.move_view(fixed, Location::Services);
+        assert_eq!(
+            w.target(following),
+            Some(1),
+            "closing a fixed presentation must not activate it"
+        );
+        w.close_window(1);
+        assert_eq!(
+            w.target(following),
+            Some(1),
+            "background work retains the last actual target"
+        );
+        w.activate_resource_in(other, 4);
+        w.move_to_window(following, other, Location::Center);
+        assert_eq!(w.target(following), Some(1));
     }
 }

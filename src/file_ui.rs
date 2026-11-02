@@ -162,6 +162,7 @@ pub struct FilePane {
     window_handle: Option<AnyWindowHandle>,
     local_scroll: ScrollHandle,
     remote_scroll: ScrollHandle,
+    restore_scroll: Option<helixlane::workspace::ViewPageState>,
     id: u64,
     visible: bool,
     window_visible: bool,
@@ -194,13 +195,27 @@ impl FilePane {
             a.transport_only();
             a
         });
-        let local = helixlane::sftp::local_home();
+        let page = {
+            let settings = settings.borrow();
+            settings
+                .workspace
+                .views
+                .iter()
+                .find(|v| v.id == id && v.page.resource == settings.workspace.target(id))
+                .map(|v| v.page.clone())
+                .unwrap_or_default()
+        };
+        let local = page
+            .local_path
+            .clone()
+            .unwrap_or_else(helixlane::sftp::local_home);
+        let remote = page.remote_path.clone().unwrap_or_else(|| ".".into());
         let visibility = cx.observe_window_visibility(window, |this, visible, _, _| {
             this.window_visible = visible.is_visible()
         });
         let ticket = settings.borrow().workspace.ticket(id);
         let local_path = cx.new(|cx| InputState::new(window, cx).default_value(local.clone()));
-        let remote_path = cx.new(|cx| InputState::new(window, cx).default_value("."));
+        let remote_path = cx.new(|cx| InputState::new(window, cx).default_value(remote.clone()));
         let address_subscriptions = vec![
             cx.subscribe_in(&local_path, window, |this, _, event: &InputEvent, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -223,6 +238,7 @@ impl FilePane {
             window_handle: None,
             local_scroll: ScrollHandle::new(),
             remote_scroll: ScrollHandle::new(),
+            restore_scroll: Some(page),
             id,
             visible: true,
             window_visible: window.is_visible(),
@@ -241,7 +257,7 @@ impl FilePane {
                 canonical_path_pending: None,
                 endpoint: None,
                 local: Browser::new(local.clone()),
-                remote: Browser::remote(".".into()),
+                remote: Browser::remote(remote),
                 busy: false,
                 error: None,
                 notice: None,
@@ -309,6 +325,34 @@ impl FilePane {
                 }
             }
         }));
+    }
+    pub fn page_state(&self) -> helixlane::workspace::ViewPageState {
+        let state = self.state.lock().unwrap();
+        let local = self.local_scroll.offset();
+        let remote = self.remote_scroll.offset();
+        helixlane::workspace::ViewPageState {
+            resource: self.ticket.map(|t| t.resource_id),
+            local_path: Some(state.local.path.clone()),
+            remote_path: Some(state.remote.path.clone()),
+            local_scroll: [local.x.into(), local.y.into()],
+            remote_scroll: [remote.x.into(), remote.y.into()],
+        }
+    }
+    fn persist_page(&self, cx: &App) {
+        let page = self.page_state();
+        if let Some(view) = self
+            .settings
+            .borrow_mut()
+            .workspace
+            .views
+            .iter_mut()
+            .find(|v| v.id == self.id)
+        {
+            view.page = page;
+        }
+        if let Some(owner) = cx.try_global::<crate::application::ApplicationOwner>() {
+            let _ = owner.save();
+        }
     }
     pub fn cancel_owned_jobs(&mut self, cx: &mut Context<Self>) {
         self.auth.update(cx, |a, _| a.cancel_owned_jobs());
@@ -1064,6 +1108,7 @@ impl FilePane {
             &self.local_path
         };
         field.update(cx, |s, cx| s.set_value(path, w, cx));
+        self.persist_page(cx);
     }
     fn pane(
         &self,
@@ -1224,6 +1269,23 @@ fn delete_tree<'a>(
 }
 impl Render for FilePane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(page) = self.restore_scroll.take() {
+            let state = self.state.lock().unwrap();
+            if state.local.entries.is_empty()
+                || (page.remote_path.is_some() && state.remote.entries.is_empty())
+            {
+                self.restore_scroll = Some(page);
+            } else {
+                if page.local_scroll.iter().all(|v| v.is_finite()) {
+                    self.local_scroll
+                        .set_offset(point(px(page.local_scroll[0]), px(page.local_scroll[1])));
+                }
+                if page.remote_scroll.iter().all(|v| v.is_finite()) {
+                    self.remote_scroll
+                        .set_offset(point(px(page.remote_scroll[0]), px(page.remote_scroll[1])));
+                }
+            }
+        }
         let canonical = self.state.lock().unwrap().canonical_path_pending.take();
         if let Some(path) = canonical {
             self.remote_path

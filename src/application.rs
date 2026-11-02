@@ -31,7 +31,7 @@ impl ApplicationOwner {
         owner.0.path.replace(Some(Settings::path()));
         owner
     }
-    fn install_settings(mut settings: Settings, cx: &mut App) -> Self {
+    pub(crate) fn install_settings(mut settings: Settings, cx: &mut App) -> Self {
         settings.workspace.ensure_windows();
         if let Some(primary) = settings.workspace.windows.iter_mut().find(|w| w.id == 1) {
             if primary.dock_layout.is_none() {
@@ -140,6 +140,10 @@ impl ApplicationOwner {
         Ok(id)
     }
     pub fn focus(&self, id: ViewId, cx: &mut App) {
+        let owner = self.clone();
+        cx.defer(move |cx| owner.focus_now(id, cx));
+    }
+    fn focus_now(&self, id: ViewId, cx: &mut App) {
         let window = self.0.settings.borrow().workspace.owner(id);
         if window.and_then(|id| self.window(id)).is_none() {
             let destination = self
@@ -249,6 +253,7 @@ impl ApplicationOwner {
                 .workspace
                 .windows
                 .iter()
+                .filter(|w| w.open)
                 .map(|w| w.id)
                 .collect::<Vec<_>>();
             for id in ids {

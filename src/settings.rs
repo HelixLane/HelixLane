@@ -233,6 +233,11 @@ impl Settings {
         {
             clean(value, &removed);
         }
+        for view in &mut saved.workspace.views {
+            if view.page.resource.is_some_and(|id| transient.contains(&id)) {
+                view.page = Default::default();
+            }
+        }
         for window in &mut saved.workspace.windows {
             if window
                 .active_resource
@@ -402,7 +407,24 @@ mod multiwindow_tests {
         record.dock_layout = Some(
             serde_json::json!({"panel_name":"helixlane.tool","info":{"panel":view},"children":[]}),
         );
+        let follow = settings
+            .workspace
+            .open_in(other, ToolKind::Information, TargetMode::Follow);
+        let page = &mut settings
+            .workspace
+            .views
+            .iter_mut()
+            .find(|v| v.id == follow)
+            .unwrap()
+            .page;
+        page.resource = Some(1);
+        page.remote_path = Some("temporary-page-must-not-persist".into());
         let saved = settings.persistent_snapshot();
+        assert!(
+            !serde_json::to_string(&saved)
+                .unwrap()
+                .contains("temporary-page-must-not-persist")
+        );
         assert!(!saved.workspace.views.iter().any(|v| v.id == view));
         assert_eq!(saved.workspace.window(other).unwrap().active_resource, None);
         let layout = saved
@@ -436,5 +458,26 @@ mod multiwindow_tests {
             actual["workspace"]["windows"][0]["top_height"],
             value["workspace"]["windows"][0]["top_height"]
         );
+    }
+}
+
+#[cfg(test)]
+mod page_state_tests {
+    use super::*;
+    #[test]
+    fn saved_file_navigation_restores_without_sessions_or_task_restart() {
+        let mut settings = Settings::default();
+        let id = settings.workspace.open(
+            crate::workspace::ToolKind::Sftp,
+            crate::workspace::TargetMode::Fixed(1),
+        );
+        let mut value = serde_json::to_value(settings).unwrap();
+        let page = serde_json::json!({"resource":1,"local_path":"/tmp/local","remote_path":"/var/log","local_scroll":[0.,-80.],"remote_scroll":[0.,-120.]});
+        value["workspace"]["views"][0]["page"] = page.clone();
+        let restored: Settings = serde_json::from_value(value).unwrap();
+        let actual = serde_json::to_value(restored.persistent_snapshot()).unwrap();
+        assert_eq!(actual["workspace"]["views"][0]["page"], page);
+        assert_eq!(restored.workspace.views[0].id, id);
+        assert_eq!(restored.workspace.views[0].session_id, None);
     }
 }

@@ -122,7 +122,45 @@ impl HelixLane {
                 let restored = serde_json::from_value::<DockAreaState>(saved)
                     .ok()
                     .is_some_and(|state| {
-                        area.update(cx, |d, cx| d.load(state, window, cx).is_ok())
+                        fn valid(
+                            panel: &PanelState,
+                            owner: WindowId,
+                            workspace: &Workspace,
+                            seen: &mut HashSet<ViewId>,
+                        ) -> bool {
+                            if panel.panel_name == "helixlane.tool" {
+                                let PanelInfo::Panel(value) = &panel.info else {
+                                    return false;
+                                };
+                                let Some(id) = value.as_u64() else {
+                                    return false;
+                                };
+                                if workspace.owner(id) != Some(owner) || !seen.insert(id) {
+                                    return false;
+                                }
+                            }
+                            panel
+                                .children
+                                .iter()
+                                .all(|p| valid(p, owner, workspace, seen))
+                        }
+                        let mut seen = HashSet::new();
+                        let valid = {
+                            let settings = this.settings.borrow();
+                            valid(&state.center, window_id, &settings.workspace, &mut seen)
+                                && [&state.left_dock, &state.right_dock, &state.bottom_dock]
+                                    .into_iter()
+                                    .flatten()
+                                    .all(|dock| {
+                                        valid(
+                                            dock.panel(),
+                                            window_id,
+                                            &settings.workspace,
+                                            &mut seen,
+                                        )
+                                    })
+                        };
+                        valid && area.update(cx, |d, cx| d.load(state, window, cx).is_ok())
                     });
                 if index == 0 {
                     main_restored = restored;
@@ -183,6 +221,9 @@ impl HelixLane {
                 let mut layout = DockLayout::tabs();
                 let mut kept = vec![];
                 for id in views {
+                    if self.settings.borrow().workspace.owner(*id) != Some(self.window_id) {
+                        continue;
+                    }
                     if let Some(panel) = panels.get(id) {
                         kept.push(*id);
                         layout = layout.panel_view(panel_handle(panel.clone()), cx);
@@ -387,6 +428,21 @@ impl HelixLane {
                     .move_view(id, Location::Services);
             }
         }
+        if cancel {
+            let ids = self
+                .settings
+                .borrow()
+                .workspace
+                .views
+                .iter()
+                .filter(|v| scope.map_or(v.window_id == self.window_id, |id| id == v.id))
+                .map(|v| v.id)
+                .collect::<Vec<_>>();
+            for id in ids {
+                self.settings.borrow_mut().workspace.close(id);
+                self.panels.borrow_mut().remove(&id);
+            }
+        }
         self.snapshot_layout(cx);
         if scope.is_none() {
             self.application.closed(self.window_id, cx);
@@ -413,6 +469,9 @@ impl HelixLane {
         self.layout_save.request();
         cx.notify();
     }
+    pub(crate) fn has_view(&self, id: ViewId, cx: &App) -> bool {
+        self.live_locations(cx).contains_key(&id)
+    }
     fn live_locations(&self, cx: &App) -> HashMap<ViewId, Location> {
         let mut found = HashMap::new();
         let panels = self.panels.borrow();
@@ -437,6 +496,26 @@ impl HelixLane {
         found
     }
     fn snapshot_layout(&mut self, cx: &mut Context<Self>) {
+        let pages = self
+            .panels
+            .borrow()
+            .iter()
+            .filter_map(|(id, panel)| {
+                panel
+                    .read(cx)
+                    .files
+                    .as_ref()
+                    .map(|file| (*id, file.read(cx).page_state()))
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut state = self.settings.borrow_mut();
+            for (id, page) in pages {
+                if let Some(view) = state.workspace.views.iter_mut().find(|v| v.id == id) {
+                    view.page = page;
+                }
+            }
+        }
         let main = self.dock.read(cx).dump(cx);
         let top = self.top.read(cx).dump(cx);
         self.sync_layout(&main, &top);
@@ -796,6 +875,10 @@ impl HelixLane {
             return;
         }
 
+        if !self.has_view(id, cx) {
+            self.receive_view(id, Location::Center, window, cx);
+            return;
+        }
         if self
             .settings
             .borrow()
@@ -1289,31 +1372,45 @@ impl Render for HelixLane {
                     .child(message),
             );
         }
-        if self.pending_close.is_some() {
+        if let Some(scope) = self.pending_close {
+            let scope_label = scope
+                .map(|id| format!("{} #{id}", language.text("close_view")))
+                .unwrap_or_else(|| format!("{} {}", language.text("close_window"), self.window_id));
             frame = frame.child(
-                row()
+                div()
+                    .flex()
+                    .flex_col()
                     .px_4()
                     .py_2()
                     .gap_2()
                     .bg(rgb(p.selected))
-                    .child(div().flex_1().child(language.text("close_scope")))
                     .child(
-                        button("continue-background", language.text("continue_background"))
-                            .on_click(
-                                cx.listener(|this, _, w, cx| this.finish_close(false, w, cx)),
-                            ),
+                        div()
+                            .child(scope_label)
+                            .child(" · ")
+                            .child(language.text("close_scope")),
                     )
                     .child(
-                        button("cancel-owned", language.text("cancel_owned"))
-                            .on_click(cx.listener(|this, _, w, cx| this.finish_close(true, w, cx))),
-                    )
-                    .child(
-                        button("keep-open", language.text("cancel")).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.pending_close = None;
-                                cx.notify();
-                            },
-                        )),
+                        row()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                button("continue-background", language.text("continue_background"))
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.finish_close(false, w, cx)
+                                    })),
+                            )
+                            .child(
+                                button("cancel-owned", language.text("cancel_owned")).on_click(
+                                    cx.listener(|this, _, w, cx| this.finish_close(true, w, cx)),
+                                ),
+                            )
+                            .child(button("keep-open", language.text("cancel")).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.pending_close = None;
+                                    cx.notify();
+                                }),
+                            )),
                     ),
             );
         }
@@ -1331,7 +1428,8 @@ impl Render for HelixLane {
                     .px_4()
                     .py_2()
                     .gap_2()
-                    .child(language.text("follow_paused"))
+                    .flex_wrap()
+                    .child(div().w_full().child(language.text("follow_paused")))
                     .child(
                         Button::new("choose-source")
                             .ghost()
@@ -1405,11 +1503,25 @@ impl Render for HelixLane {
             .into_any_element()
     }
 }
+struct ToolDragPreview(String);
+impl Render for ToolDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::current(cx);
+        div()
+            .px_3()
+            .py_2()
+            .bg(rgb(p.selected))
+            .text_color(rgb(p.text))
+            .rounded(px(5.))
+            .child(self.0.clone())
+    }
+}
 pub(crate) struct ToolPanel {
     active: bool,
     window_visible: bool,
     visibility: Option<Subscription>,
     focus_subscription: Option<Subscription>,
+    drag_node: Option<NodeId>,
     id: ViewId,
     settings: Shared,
     owner: WeakEntity<HelixLane>,
@@ -1444,6 +1556,23 @@ impl Focusable for ToolPanel {
     }
 }
 impl BasePanel for ToolPanel {
+    fn on_added_to(
+        &mut self,
+        group: WeakEntity<gpui_kit::base::dock::TabGroup>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            if let Some(group) = group.upgrade() {
+                let node = group.read(cx).node();
+                let _ = panel.update(cx, |panel, cx| {
+                    panel.drag_node = Some(node);
+                    cx.notify();
+                });
+            }
+        });
+    }
     fn closable(&self, _: &App) -> bool {
         false
     }
@@ -1497,31 +1626,23 @@ impl BasePanel for ToolPanel {
     }
 }
 impl Panel for ToolPanel {
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let s = self.settings.borrow();
-        if let Some(v) = s.workspace.views.iter().find(|v| v.id == self.id) {
-            if !v.tool.resource_scoped() {
-                return s.language.text(v.tool.key()).to_string();
-            }
-            let target = s
-                .workspace
-                .target(self.id)
-                .and_then(|id| s.workspace.resources.iter().find(|r| r.id == id))
-                .map(|r| r.name.as_str())
-                .unwrap_or("—");
-            format!(
-                "{} · {} · {}",
-                s.language.text(v.tool.key()),
-                target,
-                s.language.text(if v.mode == TargetMode::Follow {
-                    "follow"
-                } else {
-                    "fixed"
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self.label();
+        let drag = self
+            .drag_node
+            .map(|node| gpui_kit::base::dock::DragPanel::new(PanelId::from(cx.entity_id()), node));
+        div()
+            .id(("view-title-drag", self.id))
+            .cursor_grab()
+            .child(title.clone())
+            .when_some(drag, |element, drag| {
+                element.on_drag(drag, move |drag, offset, _, cx| {
+                    cx.stop_propagation();
+                    drag.set_drag_offset(offset);
+                    drag.set_preview_size(size(px(300.), px(32.)));
+                    cx.new(|_| ToolDragPreview(title.clone()))
                 })
-            )
-        } else {
-            "Closed".into()
-        }
+            })
     }
     fn dropdown_menu(
         &mut self,
@@ -1631,6 +1752,33 @@ impl Panel for ToolPanel {
     }
 }
 impl ToolPanel {
+    fn label(&self) -> String {
+        let s = self.settings.borrow();
+        if let Some(v) = s.workspace.views.iter().find(|v| v.id == self.id) {
+            if !v.tool.resource_scoped() {
+                return s.language.text(v.tool.key()).to_string();
+            }
+            let target = s
+                .workspace
+                .target(self.id)
+                .and_then(|id| s.workspace.resources.iter().find(|r| r.id == id))
+                .map(|r| r.name.as_str())
+                .unwrap_or("—");
+            format!(
+                "{} · {} · {}",
+                s.language.text(v.tool.key()),
+                target,
+                s.language.text(if v.mode == TargetMode::Follow {
+                    "follow"
+                } else {
+                    "fixed"
+                })
+            )
+        } else {
+            "Closed".into()
+        }
+    }
+
     fn update_plugin_activity(&self, cx: &mut App) {
         let active = self.settings.borrow().workspace.should_refresh(
             self.id,
@@ -1663,6 +1811,7 @@ impl ToolPanel {
             window_visible: true,
             visibility: None,
             focus_subscription: None,
+            drag_node: None,
             id,
             settings,
             owner,
@@ -2155,5 +2304,75 @@ impl Render for ToolPanel {
             .when_some(tools, |d, tools| d.child(tools))
             .child(content)
             .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "shell-tests"))]
+mod window_regression_tests {
+    use crate::application::ApplicationOwner;
+    use gpui_kit as gpui;
+    use helixlane::{
+        settings::Settings,
+        workspace::{TargetMode, ToolKind},
+    };
+
+    #[gpui::test]
+    fn services_focus_remounts_background_entity_after_its_native_window_closes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (owner, id, original) = cx.update(|cx| {
+            gpui_shell::init(cx);
+            gpui_kit::init(cx);
+            let mut settings = Settings::default();
+            settings.workspace.ensure_windows();
+            let id = settings
+                .workspace
+                .open(ToolKind::Sftp, TargetMode::Fixed(1));
+            let other = settings.workspace.create_window(None);
+            let owner = ApplicationOwner::install_settings(settings, cx);
+            owner.open(1, cx).unwrap();
+            owner.open(other, cx).unwrap();
+            let original = owner.panels().borrow().get(&id).unwrap().entity_id();
+            let (handle, view) = owner.window(1).unwrap();
+            handle
+                .update(cx, |_, w, cx| {
+                    view.update(cx, |v, cx| v.move_window(id, Some(other), w, cx))
+                })
+                .unwrap()
+                .unwrap();
+            let (handle, view) = owner.window(other).unwrap();
+            handle
+                .update(cx, |_, w, cx| {
+                    view.update(cx, |v, cx| {
+                        v.request_close(None, w, cx);
+                        v.finish_close(false, w, cx);
+                    })
+                })
+                .unwrap()
+                .unwrap();
+            (owner, id, original)
+        });
+        cx.update(|cx| {
+            let (handle, view) = owner.window(1).unwrap();
+            handle
+                .update(cx, |_, w, cx| {
+                    view.update(cx, |v, cx| v.focus_tool(id, w, cx))
+                })
+                .unwrap()
+                .unwrap();
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let (_, view) = owner.window(1).unwrap();
+            assert!(
+                view.upgrade().unwrap().read(cx).has_view(id, cx),
+                "logical ownership changed but no native dock contains the panel"
+            );
+            assert_eq!(
+                owner.panels().borrow().get(&id).unwrap().entity_id(),
+                original
+            );
+            assert_eq!(owner.settings().borrow().workspace.owner(id), Some(1));
+        });
     }
 }

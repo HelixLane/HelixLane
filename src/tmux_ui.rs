@@ -33,6 +33,8 @@ pub struct TmuxPane {
     name: Entity<InputState>,
     rename: Entity<InputState>,
     pending: Option<(u64, ExecTask, bool)>,
+    background_tasks: Vec<(String, ExecTask)>,
+    history: Vec<String>,
     generation: u64,
     sessions: Vec<String>,
     output: String,
@@ -83,6 +85,8 @@ impl TmuxPane {
                 })
             }),
             pending: None,
+            background_tasks: vec![],
+            history: vec![],
             generation: 0,
             sessions: vec![],
             output: String::new(),
@@ -120,6 +124,9 @@ impl TmuxPane {
         }));
     }
     pub fn cancel_owned_jobs(&mut self, cx: &mut Context<Self>) {
+        for (_, task) in &mut self.background_tasks {
+            task.cancel();
+        }
         self.auth.update(cx, |a, _| a.cancel_owned_jobs());
         if let Some((_, task, _)) = &mut self.pending {
             task.cancel();
@@ -159,11 +166,23 @@ impl TmuxPane {
         if p == self.profile && ticket == self.ticket {
             return;
         }
+        if let Some((_, mut task, collection)) = self.pending.take() {
+            if collection {
+                task.cancel();
+            } else {
+                self.background_tasks.push((
+                    format!(
+                        "{}@{}:{}",
+                        self.profile.username, self.profile.host, self.profile.port
+                    ),
+                    task,
+                ));
+            }
+        }
         self.ticket = ticket;
         self.profile = p.clone();
         self.auth.update(cx, |a, cx| a.bind(p, w, cx));
         self.generation += 1;
-        self.pending = None;
         self.sessions.clear();
         self.output.clear();
         self.error = None;
@@ -173,6 +192,25 @@ impl TmuxPane {
         self.name.read(cx).focus_handle(cx)
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
+        self.background_tasks
+            .retain_mut(|(target, task)| match task.result.try_recv() {
+                Ok(result) => {
+                    self.history.push(format!(
+                        "{target}: {}",
+                        match result {
+                            Ok(output) => String::from_utf8_lossy(&output.bytes).into_owned(),
+                            Err(error) => error,
+                        }
+                    ));
+                    false
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => false,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
+            });
+        if self.history.len() > 5 {
+            self.history.drain(..self.history.len() - 5);
+        }
+
         let should = self.settings.borrow().workspace.should_refresh(
             self.id,
             self.visible,
@@ -395,6 +433,18 @@ impl Render for TmuxPane {
                     }
                 })),
         );
+        for result in &self.history {
+            content = content.child(div().text_size(px(11.)).text_color(rgb(p.muted)).child(
+                format!(
+                    "{}: {result}",
+                    if zh {
+                        "先前目标的任务结果"
+                    } else {
+                        "Previous target job result"
+                    }
+                ),
+            ));
+        }
         if !self.output.is_empty() {
             content = content.child(
                 div()
