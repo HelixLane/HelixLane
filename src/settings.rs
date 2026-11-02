@@ -115,16 +115,52 @@ impl Default for Settings {
 }
 impl Settings {
     pub fn path() -> PathBuf {
-        std::env::var_os("HELIXLANE_SETTINGS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::var_os("XDG_CONFIG_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
-                    })
-                    .join("helixlane/settings.sqlite")
-            })
+        if let Some(path) = std::env::var_os("HELIXLANE_SETTINGS") { return PathBuf::from(path); }
+        fn env_path(name: &str) -> Option<PathBuf> { std::env::var_os(name).map(PathBuf::from).filter(|p| p.is_absolute()) }
+        #[cfg(target_os = "windows")]
+        let root = env_path("APPDATA").or_else(||env_path("USERPROFILE").map(|p|p.join("AppData/Roaming")));
+        #[cfg(target_os = "macos")]
+        let root = env_path("HOME").map(|p|p.join("Library/Application Support"));
+        #[cfg(not(any(target_os = "windows",target_os = "macos")))]
+        let root = env_path("XDG_CONFIG_HOME").or_else(||env_path("HOME").map(|p|p.join(".config")));
+        // Missing OS home is an explicit startup error, never a cwd-relative database.
+        root.expect("Cannot locate user settings directory; set HELIXLANE_SETTINGS explicitly").join("helixlane/settings.sqlite")
+    }
+    /// One central boundary covers toolbar/profile/layout/autosave writes together.
+    /// Transient resources and their view identities never enter recovery snapshots.
+    pub fn persistent_snapshot(&self) -> Self {
+        let mut saved = self.clone();
+        let transient: std::collections::HashSet<_> = saved.workspace.resources.iter().filter(|r|r.profiles.iter().any(|p|p.ephemeral)).map(|r|r.id).collect();
+        let removed: std::collections::HashSet<_> = saved.workspace.views.iter().filter(|v|v.ephemeral || matches!(v.mode,crate::workspace::TargetMode::Fixed(id) if transient.contains(&id))).map(|v|v.id).collect();
+        for id in &removed { saved.workspace.close(*id); }
+        saved.workspace.resources.retain(|r|!transient.contains(&r.id));
+        if saved.workspace.active_resource.is_some_and(|id|transient.contains(&id)) {saved.workspace.active_resource=saved.workspace.resources.first().map(|r|r.id);}
+        fn clean(value: &mut serde_json::Value, removed: &std::collections::HashSet<u64>) {
+            fn transient(v:&serde_json::Value,removed:&std::collections::HashSet<u64>)->bool {v.get("panel_name").and_then(|v|v.as_str())==Some("helixlane.tool") && v.get("info").and_then(|v|v.get("panel")).and_then(|v|v.as_u64()).is_some_and(|id|removed.contains(&id))}
+            if transient(value,removed){*value=serde_json::json!({"panel_name":"TabPanel","children":[],"info":{"tabs":{"active_index":0}}});return;}
+            match value {
+                serde_json::Value::Array(values)=>{for v in values{clean(v,removed);}},
+                serde_json::Value::Object(map)=>{
+                    if let Some(children)=map.get_mut("children").and_then(|v|v.as_array_mut()){
+                        let kept:Vec<bool>=children.iter().map(|v|!transient(v,removed)).collect();
+                        let changed=kept.iter().any(|keep|!*keep);
+                        let mut index=0;children.retain(|_|{let keep=kept[index];index+=1;keep});
+                        if changed {if let Some(info)=map.get_mut("info"){
+                            if let Some(active)=info.get_mut("tabs").and_then(|v|v.get_mut("active_index")){
+                                let old=active.as_u64().unwrap_or(0) as usize;
+                                let adjusted=kept.iter().take(old).filter(|keep|**keep).count().min(kept.iter().filter(|keep|**keep).count().saturating_sub(1));*active=serde_json::json!(adjusted);
+                            }
+                            if let Some(sizes)=info.get_mut("stack").and_then(|v|v.get_mut("sizes")).and_then(|v|v.as_array_mut()){
+                                let mut index=0;sizes.retain(|_|{let keep=kept.get(index).copied().unwrap_or(false);index+=1;keep});
+                            }
+                        }}
+                    }
+                    for v in map.values_mut(){clean(v,removed);}
+                },_=>{}
+            }
+        }
+        for value in [&mut saved.dock_layout,&mut saved.top_layout].into_iter().flatten() {clean(value,&removed);}
+        saved
     }
     fn database(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
         if let Some(parent) = path.parent() {
@@ -202,6 +238,7 @@ impl Settings {
         for r in &mut s.workspace.resources {
             if r.profiles.is_empty() {
                 r.profiles.push(crate::workspace::ConnectionProfile {
+                    ephemeral: false,
                     id: r.id,
                     host: String::new(),
                     port: 22,
@@ -229,16 +266,17 @@ impl Settings {
         Ok(s)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        let snapshot = self.persistent_snapshot();
         let mut db = Self::database(path).map_err(|e| e.to_string())?;
         let tx = db.transaction().map_err(|e| e.to_string())?;
         tx.execute(
             "INSERT OR REPLACE INTO settings(id,value) VALUES(1,?1)",
-            [serde_json::to_string(self).map_err(|e| e.to_string())?],
+            [serde_json::to_string(&snapshot).map_err(|e| e.to_string())?],
         )
         .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM resources", [])
             .map_err(|e| e.to_string())?;
-        for r in &self.workspace.resources {
+        for r in &snapshot.workspace.resources {
             tx.execute(
                 "INSERT INTO resources(id,value) VALUES(?1,?2)",
                 rusqlite::params![r.id, serde_json::to_string(r).map_err(|e| e.to_string())?],

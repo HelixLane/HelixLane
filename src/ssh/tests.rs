@@ -92,6 +92,7 @@ impl server::Handler for Fixture {
 }
 pub(super) fn profile(port: u16) -> ConnectionProfile {
     ConnectionProfile {
+        ephemeral: false,
         id: 99,
         host: "127.0.0.1".into(),
         port,

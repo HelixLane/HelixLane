@@ -1,0 +1,1 @@
+fn main() { if let Err(error) = helixlane::launch::run_proxy(helixlane::launch::parse_putty, helixlane::launch::PUTTY_HELP) { eprintln!("HelixLane launcher: {}", helixlane::launch::diagnostic(&error)); std::process::exit(2); } }

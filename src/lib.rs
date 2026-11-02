@@ -5,3 +5,5 @@ pub mod ssh;
 pub mod tasks;
 pub mod terminal;
 pub mod workspace;
+
+pub mod launch;

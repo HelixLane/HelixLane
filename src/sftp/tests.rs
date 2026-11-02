@@ -38,6 +38,7 @@ fn openssh_backend_operations_atomic_upload_external_conflict_and_sftp_only_tran
                 .unwrap();
         });
         let profile = ConnectionProfile {
+            ephemeral: false,
             id: 700,
             host: "127.0.0.1".into(),
             port,
@@ -185,6 +186,7 @@ fn openssh_two_host_copy_uses_local_staging_and_cancellation_preserves_remote_or
                     .unwrap();
             }));
             let profile = ConnectionProfile {
+                ephemeral: false,
                 id: 800 + n,
                 host: "127.0.0.1".into(),
                 port,
@@ -315,6 +317,7 @@ fn openssh_regular_file_never_replaces_nonempty_directory() {
         });
         let session = service.connect_transport(
             ConnectionProfile {
+                ephemeral: false,
                 id: 990,
                 host: "127.0.0.1".into(),
                 port,

@@ -160,6 +160,8 @@ pub enum AuthMethod {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectionProfile {
+    #[serde(skip)]
+    pub ephemeral: bool,
     pub id: u64,
     pub host: String,
     pub port: u16,
@@ -234,6 +236,8 @@ pub enum Location {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ViewInstance {
+    #[serde(skip)]
+    pub ephemeral: bool,
     pub id: ViewId,
     pub tool: ToolKind,
     pub mode: TargetMode,
@@ -334,6 +338,7 @@ impl Default for Workspace {
                     tags: vec![],
                     notes: "Demonstration resource. No connection has been opened.".into(),
                     profiles: vec![ConnectionProfile {
+                        ephemeral: false,
                         id,
                         host: format!("host-{id}.example.invalid"),
                         port: 22,
@@ -381,6 +386,7 @@ impl Workspace {
         let id = self.next_id;
         self.next_id += 1;
         self.views.push(ViewInstance {
+            ephemeral: false,
             id,
             tool,
             mode,
@@ -483,6 +489,7 @@ impl Workspace {
             tags: vec![],
             notes: String::new(),
             profiles: vec![ConnectionProfile {
+                ephemeral: false,
                 id,
                 host: String::new(),
                 port: 22,

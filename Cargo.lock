@@ -3276,7 +3276,10 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "gpui-kit",
+ "hmac 0.12.1",
  "keyring",
+ "libc",
+ "percent-encoding",
  "rusqlite",
  "russh",
  "russh-sftp",
@@ -3284,6 +3287,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "url",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
