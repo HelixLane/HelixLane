@@ -426,6 +426,41 @@ impl TransferManager {
         });
         self.persist();
     }
+    async fn record_owned(
+        &self,
+        id: u64,
+        target: &Endpoint,
+        path: &str,
+        digest: Option<&Vec<u8>>,
+    ) -> Result<(), String> {
+        let tracked = self.jobs.lock().unwrap().get(&id).is_some_and(|work| {
+            target.label() == work.spec.target.label()
+                && target.path_within(path, &work.spec.target_path)
+        });
+        if !tracked {
+            return Ok(());
+        }
+        let current = Fingerprint::capture(target, path)
+            .await?
+            .ok_or("Committed target disappeared")?;
+        if current.digest.as_ref() != digest {
+            return Err("Target changed after commit".into());
+        }
+        {
+            let mut jobs = self.jobs.lock().unwrap();
+            if let Some(work) = jobs.get_mut(&id) {
+                work.spec.target_tree.insert(path.into(), current.clone());
+                if work.spec.target_path == path {
+                    work.spec.target_state = Some(current);
+                    // Skip was evaluated against the original destination before
+                    // any writes. A newly created partial tree now belongs to us.
+                    work.spec.conflict = Conflict::Overwrite;
+                }
+            }
+        }
+        self.persist();
+        Ok(())
+    }
     fn copy_tree<'a>(
         &'a self,
         id: u64,
@@ -475,6 +510,7 @@ impl TransferManager {
                         }
                     } else {
                         target.mkdir(to).await?;
+                        self.record_owned(id, target, to, None).await?;
                     }
                     for e in source.list(from).await? {
                         crate::sftp::validate_child_name(
@@ -499,6 +535,7 @@ impl TransferManager {
                     ensure_target_kind(&entry.kind, target_before.as_ref().map(|f| &f.entry), to)?;
                     let temp = self.temporary_path(id, to);
                     let mut owned_temp = false;
+                    let mut committed = false;
                     let result = async {
                         let mut input = source.reader(from).await?;
                         let mut output = target.create_new(&temp).await?;
@@ -529,10 +566,19 @@ impl TransferManager {
                         // Validation may await a full-file digest. Cancellation
                         // accepted during that read must stop before commit.
                         check(cancel)?;
+                        // Private staging stays 0600 until all bytes and both snapshots are validated.
+                        // Overwrites preserve destination permissions; new files remain private (0600).
+                        if let Some(existing) = &target_before {
+                            if matches!(target, Endpoint::Remote { .. }) || cfg!(unix) {
+                                target.chmod(&temp, existing.entry.permissions & 0o7777).await?;
+                            }
+                        }
+                        check(cancel)?;
                         match target {
                             Endpoint::Local => {
                                 validate_commit_target(target,to,&entry.kind,target_before.as_ref(),cancel).await?;
                                 target.rename(&temp,to).await?;
+                                committed = true;
                             },
                             Endpoint::Remote { .. } => {
                                 if target_before.is_some() {
@@ -549,16 +595,27 @@ impl TransferManager {
                                         if let Err(rollback)=target.rename(&backup,to).await{return Err(format!("Commit failed: {e}; original retained at {backup}; rollback failed: {rollback}"))}
                                         return Err(e);
                                     }
+                                    committed = true;
                                     target.remove(&backup).await.map_err(|e|format!("Upload committed; previous target retained at {backup}; cleanup failed: {e}"))?;
                                 } else {
                                     validate_commit_target(target,to,&entry.kind,None,cancel).await?;
                                     target.rename(&temp, to).await?;
+                                    committed = true;
                                 }
                             }
                         }
                         Ok(())
                     }
                     .await;
+                    if committed {
+                        self.record_owned(
+                            id,
+                            target,
+                            to,
+                            before.as_ref().and_then(|f| f.digest.as_ref()),
+                        )
+                        .await?;
+                    }
                     if result.is_err() && owned_temp {
                         let _ = target.remove(&temp).await;
                     }

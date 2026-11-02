@@ -1,5 +1,35 @@
 use super::*;
 use crate::sftp::{Endpoint, Fingerprint};
+#[cfg(unix)]
+#[tokio::test]
+async fn overwrite_preserves_executable_and_shared_destination_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let p = root("overwrite-modes");
+    std::fs::write(p.join("source"), b"replacement").unwrap();
+    for mode in [0o755, 0o640] {
+        let target = p.join(format!("target-{mode}"));
+        std::fs::write(&target, b"previous").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).unwrap();
+        let spec = TransferSpec::capture(
+            Endpoint::Local,
+            p.join("source").display().to_string(),
+            Endpoint::Local,
+            target.display().to_string(),
+            Conflict::Overwrite,
+        )
+        .await
+        .unwrap();
+        let manager = TransferManager::new(1);
+        manager.run(manager.submit_paused(spec)).await;
+        assert_eq!(manager.jobs()[0].state, JobState::Complete);
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            mode
+        );
+    }
+    std::fs::remove_dir_all(p).unwrap();
+}
 fn root(name: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!("helixlane-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
@@ -545,4 +575,94 @@ async fn close_cancels_pending_capture_but_allows_later_new_submission() {
         manager.jobs().iter().find(|j| j.id == new).unwrap().state,
         JobState::Cancelled
     );
+}
+
+#[tokio::test]
+async fn recursive_owned_progress_retries_and_recovers_but_external_changes_fail() {
+    for after_child in [false, true] {
+        let p = root(if after_child {
+            "owned-child"
+        } else {
+            "owned-directory"
+        });
+        std::fs::create_dir(p.join("src")).unwrap();
+        for index in 0..32 {
+            std::fs::write(p.join(format!("src/{index:02}")), vec![index as u8; 4096]).unwrap();
+        }
+        let journal = p.join("journal.json");
+        let manager = TransferManager::with_journal(1, journal.clone()).unwrap();
+        let spec = TransferSpec::capture(
+            Endpoint::Local,
+            p.join("src").display().to_string(),
+            Endpoint::Local,
+            p.join("dst").display().to_string(),
+            Conflict::Overwrite,
+        )
+        .await
+        .unwrap();
+        let id = manager.submit_paused(spec);
+        let running = manager.clone();
+        let task = tokio::spawn(async move { running.run(id).await });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let reached = if after_child {
+                    std::fs::read_dir(p.join("dst")).is_ok_and(|entries| {
+                        entries
+                            .flatten()
+                            .any(|e| e.file_name().to_string_lossy().len() == 2)
+                    })
+                } else {
+                    p.join("dst").is_dir()
+                };
+                if reached {
+                    manager.cancel(id);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.await.unwrap();
+        assert_eq!(manager.jobs()[0].state, JobState::Cancelled);
+        // External content must not be adopted alongside our own progress.
+        let check = TransferManager::with_journal(1, journal.clone()).unwrap();
+        let recovery = check.recoveries()[0].id.clone();
+        std::fs::write(p.join("dst/unrelated"), b"not ours").unwrap();
+        assert!(check.recover(&recovery).await.unwrap_err().contains("Target changed"));
+        std::fs::remove_file(p.join("dst/unrelated")).unwrap();
+        let restored = if after_child { check } else { manager.clone() };
+        let resumed = if after_child {
+            restored.recover(&recovery).await.expect("own committed progress must be recoverable")
+        } else {
+            restored.retry(id).expect("own created directory must be retryable");
+            id
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while restored
+                .jobs()
+                .iter()
+                .any(|j| j.id == resumed && matches!(j.state, JobState::Queued | JobState::Running))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(restored.jobs()[0].state, JobState::Complete);
+        for index in 0..32 {
+            assert_eq!(
+                std::fs::read(p.join(format!("dst/{index:02}"))).unwrap(),
+                vec![index as u8; 4096]
+            );
+        }
+        // Wait for the final durable completion before removing the fixture.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if std::fs::read(&journal).ok().and_then(|bytes| serde_json::from_slice::<Vec<Recovery>>(&bytes).ok()).is_some_and(|r| r.is_empty()) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        std::fs::remove_dir_all(p).unwrap();
+    }
 }

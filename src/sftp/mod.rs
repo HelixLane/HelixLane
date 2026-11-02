@@ -371,9 +371,16 @@ fn remote_entry(path: &str, m: FileAttributes) -> Entry {
 }
 impl Fingerprint {
     pub async fn capture(endpoint: &Endpoint, path: &str) -> Result<Option<Self>, String> {
-        let Some(entry) = endpoint.stat(path).await? else {
+        let Some(mut entry) = endpoint.stat(path).await? else {
             return Ok(None);
         };
+        // A directory's membership is captured separately in the tree. Its
+        // byte count/mtime change as our own children commit, so they are not
+        // content identity; retain kind, path and permissions for validation.
+        if entry.kind == Kind::Directory {
+            entry.size = 0;
+            entry.modified = 0;
+        }
         let digest = if entry.kind == Kind::File {
             let mut reader = endpoint.reader(path).await?;
             let mut hash = Sha256::new();
