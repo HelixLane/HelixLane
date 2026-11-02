@@ -1,9 +1,8 @@
 mod app;
-mod editor;
 mod theme;
 
 use app::HelixLane;
-use gpui_kit::component::{Theme, ThemeMode, TitleBar};
+use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 actions!(helixlane, [Quit]);
@@ -11,7 +10,6 @@ actions!(helixlane, [Quit]);
 fn main() {
     application().with_assets(assets::Assets).run(|cx| {
         init(cx);
-        Theme::change(ThemeMode::Dark, None, cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
         cx.on_window_closed(|cx, _| {

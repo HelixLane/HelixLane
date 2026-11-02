@@ -7,5 +7,17 @@ description = "HelixLane desktop application built with Rust and GPUI Kit"
 license = "Apache-2.0"
 publish = false
 
+[features]
+default = ["desktop"]
+desktop = ["dep:gpui-kit"]
+
+[[bin]]
+name = "helixlane"
+path = "src/main.rs"
+required-features = ["desktop"]
+
 [dependencies]
-gpui-kit = "0.8.0"
+gpui-kit = { version = "0.8.0", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
