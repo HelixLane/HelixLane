@@ -52,7 +52,7 @@ fn connection_url(raw: &str, legacy: bool) -> Result<OpenRequest, String> {
         }),
         protocol,
         mode: OpenMode::Activate,
-        remote_path: if u.path().is_empty() || u.path() == "/" {
+        remote_path: if u.path().is_empty() {
             None
         } else {
             Some(decode_text(u.path())?)
@@ -278,7 +278,7 @@ pub fn parse_putty(args: &[String]) -> Result<Entry, String> {
                 i += 1;
                 native.push(args.get(i).ok_or_else(invalid)?.clone());
             }
-            v if !v.starts_with('-') => native.push(v.into()),
+            v if !v.starts_with('-') && !v.contains("://") => native.push(v.into()),
             _ => return Err("Unsupported PuTTY option / 不支持的 PuTTY 参数；参数值已隐藏".into()),
         }
         i += 1;

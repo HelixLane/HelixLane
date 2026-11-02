@@ -249,5 +249,14 @@ fn wire_rejects_invalid_targets_unknown_fields_and_controls() {
     ));
     assert!(encode(&huge).is_err());
 }
-#[test] fn explicit_sftp_root_path_reaches_request(){assert_eq!(open(&["open","sftp://alice@host/"]).remote_path.as_deref(),Some("/"));}
-#[test] fn putty_rejects_non_host_sftp_urls(){assert!(parse_putty(&args(&["sftp://alice@host/a"])).is_err());}
+#[test]
+fn explicit_sftp_root_path_reaches_request() {
+    assert_eq!(
+        open(&["open", "sftp://alice@host/"]).remote_path.as_deref(),
+        Some("/")
+    );
+}
+#[test]
+fn putty_rejects_non_host_sftp_urls() {
+    assert!(parse_putty(&args(&["sftp://alice@host/a"])).is_err());
+}
