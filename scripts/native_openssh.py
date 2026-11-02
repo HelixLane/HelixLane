@@ -2,7 +2,8 @@
 """Provision disposable full sshd fixtures. Linux CI only; requires passwordless sudo.
 Never mutates the host sshd config. Explicit failure, never a successful skip.
 """
-import json, os, pathlib, re, shutil, socket, subprocess, tempfile, time
+import json, os, pathlib, pwd, re, socket, subprocess, sys, tempfile, time
+from native_fixture_cleanup import finish_fixture, process, require_native_proc
 
 def run(*args, **kw): return subprocess.run(args, check=True, **kw)
 def port():
@@ -10,12 +11,14 @@ def port():
         s.bind(('127.0.0.1',0)); return s.getsockname()[1]
 root=pathlib.Path(tempfile.mkdtemp(prefix='helixlane-native-'));root.chmod(0o755)
 user=f'hltest{os.getpid()}'
-children=[]; agent=None; created=False
+children=[]; identities=[]; agent=None; created=False; uid=None; failure=None
 try:
+    require_native_proc()
     for binary in ['/usr/sbin/sshd','/usr/lib/openssh/sftp-server','/usr/bin/tmux','/usr/bin/ssh-agent']:
         assert pathlib.Path(binary).is_file(), f'Required native dependency missing: {binary}'
     run('sudo','-n','true')
     run('sudo','useradd','--create-home','--shell','/bin/bash',user);created=True
+    uid=pwd.getpwnam(user).pw_uid
     password='helixlane-native-test-only'
     run('sudo','chpasswd',input=f'{user}:{password}\n',text=True)
     home=f'/home/{user}'; key=root/'client';host=root/'host'
@@ -45,6 +48,7 @@ LogLevel VERBOSE
 '''+('ForceCommand internal-sftp\n' if index else ''))
         run('sudo','/usr/sbin/sshd','-t','-f',str(config))
         children.append(subprocess.Popen(['sudo','/usr/sbin/sshd','-D','-e','-f',str(config)],stdout=log.open('w'),stderr=subprocess.STDOUT))
+        identities.append(process(children[-1].pid).identity)
         for _ in range(100):
             assert children[-1].poll() is None, log.read_text()
             try:
@@ -61,12 +65,17 @@ LogLevel VERBOSE
     config=root/'client.json';config.write_text(json.dumps(dict(root=str(root),home=home,user=user,password=password,key=str(key),fingerprint=fingerprint,port=ports[0],sftp_port=ports[1])))
     env['HELIXLANE_NATIVE_CONFIG']=str(config)
     run('cargo','test','--locked','--features','shell-tests','--test','native_openssh','--','--ignored','--nocapture',env=env)
+except BaseException as error:
+    failure=error
+    raise
 finally:
-    for p in children:
-        if p.poll() is None:
-            subprocess.run(['sudo','pkill','-TERM','-P',str(p.pid)],check=False);p.wait(timeout=10)
-    if agent:run('ssh-agent','-k',env=agent,stdout=subprocess.DEVNULL)
-    if created:run('sudo','userdel','--remove',user)
-    logs=pathlib.Path('target/native-logs');logs.mkdir(parents=True,exist_ok=True)
-    for log in root.glob('*.log'):shutil.copy2(log,logs/log.name)
-    shutil.rmtree(root)
+    steps=[]
+    if uid is not None:
+        command=['sudo','-n',sys.executable,str(pathlib.Path(__file__).with_name('native_fixture_cleanup.py')),'--uid',str(uid)]
+        for pid,started in identities:command.extend(['--root',f'{pid}:{started}'])
+        steps.append(('Stop fixture descendants and disposable-user sessions',lambda: run(*command,timeout=20)))
+    for child in children:
+        steps.append((f'Reap fixture wrapper {child.pid}',lambda child=child: child.wait(timeout=3)))
+    if agent:steps.append(('Stop fixture agent',lambda: run('ssh-agent','-k',env=agent,stdout=subprocess.DEVNULL,timeout=5)))
+    if created:steps.append(('Remove disposable user',lambda: run('sudo','-n','userdel','--remove',user,timeout=10)))
+    finish_fixture(root,steps,pathlib.Path('target/native-logs'),failure)

@@ -2,7 +2,7 @@ name: Native validation and packages
 on:
   pull_request:
   push:
-    branches: [main, feat/ssh-sftp-workbench]
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read
@@ -74,7 +74,9 @@ jobs:
         run: cargo test --locked --features shell-tests -- --nocapture
       - name: Full sshd authentication, SFTP, jump and forwarding
         if: runner.os == 'Linux'
-        run: python3 scripts/native_openssh.py
+        run: |
+          python3 -B scripts/native_fixture_cleanup_test.py -v
+          python3 scripts/native_openssh.py
       - name: Build actual desktop and compatibility launchers
         run: cargo build --locked --bins --features shell-tests
       - name: Native executable stream, exit and Windows subsystem checks
