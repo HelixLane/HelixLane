@@ -540,7 +540,7 @@ mod advanced_route_tests {
         w.resources.last_mut().unwrap().profiles[0].host = "jump-a".into();
         w.resources[0].profiles[0].jump_resource = Some(jump);
         w.active_resource = Some(destination);
-        let view = w.views[0].id;
+        let view = w.open(ToolKind::Terminal, TargetMode::Follow);
         let captured = w.capture_task_target(view).unwrap();
         w.resources.last_mut().unwrap().profiles[0].host = "mutated".into();
         let snapshot = serde_json::to_string(&captured.profile).unwrap();

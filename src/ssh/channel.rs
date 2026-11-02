@@ -28,29 +28,32 @@ impl Drop for Permit {
     }
 }
 pub struct ManagedChannel {
-    channel: russh::Channel<client::Msg>,
-    permit: Permit,
+    channel: Option<russh::Channel<client::Msg>>,
+    permit: Option<Permit>,
 }
 impl ManagedChannel {
     pub(super) fn new(channel: russh::Channel<client::Msg>, permit: Permit) -> Self {
-        Self { channel, permit }
+        Self {
+            channel: Some(channel),
+            permit: Some(permit),
+        }
     }
-    pub fn into_stream(self) -> ManagedStream {
+    pub fn into_stream(mut self) -> ManagedStream {
         ManagedStream {
-            stream: self.channel.into_stream(),
-            _permit: self.permit,
+            stream: self.channel.take().unwrap().into_stream(),
+            _permit: self.permit.take().unwrap(),
         }
     }
 }
 impl Deref for ManagedChannel {
     type Target = russh::Channel<client::Msg>;
     fn deref(&self) -> &Self::Target {
-        &self.channel
+        self.channel.as_ref().unwrap()
     }
 }
 impl DerefMut for ManagedChannel {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.channel
+        self.channel.as_mut().unwrap()
     }
 }
 pub struct ManagedStream {
@@ -79,5 +82,28 @@ impl AsyncWrite for ManagedStream {
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+impl Drop for ManagedChannel {
+    fn drop(&mut self) {
+        // Raw russh channels do not close on drop; its stream adapter does.
+        if let Some(channel) = self.channel.take() {
+            drop(channel.into_stream());
+        }
+    }
+}
+pub(super) struct TerminalLease {
+    pub writer: Arc<russh::ChannelWriteHalf<client::Msg>>,
+    pub permit: Option<Permit>,
+}
+impl Drop for TerminalLease {
+    fn drop(&mut self) {
+        let writer = self.writer.clone();
+        let permit = self.permit.take();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(5), writer.close()).await;
+            drop(permit);
+        });
     }
 }

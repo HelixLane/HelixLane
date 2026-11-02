@@ -156,16 +156,20 @@ async fn run_forward(
             );
             session.state.lock().unwrap().revision += 1;
             loop {
+                if *stopped.borrow() {
+                    break;
+                }
                 tokio::select! {
                     _=stopped.changed()=>break,
                     _=tokio::time::sleep(Duration::from_millis(100)),if ssh.is_closed()=>break,
                     _=streams.join_next(),if !streams.is_empty()=>{},
                     result=listener.accept()=>{
+                        if streams.len() >= 128 { let _ = result; continue; }
                         let (mut tcp,origin)=result.map_err(|_|"Forward listener failed")?;let session=session.clone();let spec=job.spec.clone();
                         streams.spawn(async move {
                             let socks=matches!(spec,ForwardSpec::Socks {..});
                             let target=match spec {ForwardSpec::Local {target,..}=>target,ForwardSpec::Socks {..}=>match tokio::time::timeout(Duration::from_secs(15),socks_request(&mut tcp)).await {Ok(Ok(target))=>target,_=>return},_=>unreachable!()};
-                            let mut stream=match direct(&session,&target,origin).await {Ok(stream)=>stream,Err(_)=>{if socks {let _=socks_reply(&mut tcp,5).await;}return}};
+                            let mut stream=match direct(&session,&target,origin).await {Ok(stream)=>stream,Err(error)=>{{let mut state=session.state.lock().unwrap();state.input_notice=Some(error);state.revision+=1;}if socks {let _=socks_reply(&mut tcp,5).await;}return}};
                             if socks && socks_reply(&mut tcp,0).await.is_err() {return;}
                             let _=tokio::io::copy_bidirectional(&mut tcp,&mut stream).await;
                         });
@@ -179,7 +183,15 @@ async fn run_forward(
                 Duration::from_secs(15),
                 ssh.tcpip_forward(address.clone(), bind.port().into()),
             );
-            let assigned = tokio::select! {_=stopped.changed()=>return Ok(()),r=requested=>r.map_err(|_|"Remote forward request timed out")?.map_err(|_|"Remote forwarding refused")?};
+            // A global request cannot be recalled before its reply: learn the
+            // allocated port, then cancel it, even if Stop arrived meanwhile.
+            let assigned = match requested.await {
+                Ok(result) => result.map_err(|_| "Remote forwarding refused")?,
+                Err(_) => {
+                    session.disconnect();
+                    return Err("Remote forward request timed out; connection closed to remove unknown listener".into());
+                }
+            };
             let port = if bind.port() == 0 {
                 u16::try_from(assigned)
                     .ok()
@@ -201,11 +213,14 @@ async fn run_forward(
                 ForwardStatus::Listening(SocketAddr::new(bind.ip(), port));
             session.state.lock().unwrap().revision += 1;
             loop {
+                if *stopped.borrow() {
+                    break;
+                }
                 tokio::select! {
                     _=stopped.changed()=>break,
                     _=tokio::time::sleep(Duration::from_millis(100)),if ssh.is_closed()=>break,
                     _=streams.join_next(),if !streams.is_empty()=>{},
-                    channel=incoming.recv()=>{let Some(channel)=channel else {break};let target=target.clone();let permit=match session.capacity.acquire(session.profile.transport_policy) {Ok(p)=>p,Err(_)=>{let _=channel.close().await;continue;}};
+                    channel=incoming.recv()=>{let Some(channel)=channel else {break};if streams.len()>=128 {let _=channel.close().await;continue;}let target=target.clone();let permit=match session.capacity.acquire(session.profile.transport_policy) {Ok(p)=>p,Err(error)=>{{let mut state=session.state.lock().unwrap();state.input_notice=Some(error);state.revision+=1;}let _=channel.close().await;continue;}};
                         streams.spawn(async move {let mut stream=channel::ManagedChannel::new(channel,permit).into_stream();if let Ok(Ok(mut tcp))=tokio::time::timeout(Duration::from_secs(15),TcpStream::connect((target.host.as_str(),target.port))).await {let _=tokio::io::copy_bidirectional(&mut tcp,&mut stream).await;}});
                     }
                 }

@@ -78,30 +78,25 @@ pub(super) async fn authenticate(
         secret = tokio::task::spawn_blocking(move || credentials::load(&reference))
             .await
             .map_err(|_| "Keychain task failed")??;
-    } else if prompt_missing
-        && matches!(profile.auth, AuthMethod::Password)
-        && secret.expose().is_empty()
-    {
+    } else if prompt_missing && uses_secret && secret.expose().is_empty() {
         secret = session
             .ask_auth(AuthPrompt {
                 hop: hop.clone(),
                 instructions: "Jump host authentication / 跳板主机认证".into(),
-                prompts: vec![("Password / 密码".into(), false)],
+                prompts: vec![("Password / passphrase / 密码或私钥口令".into(), false)],
             })
             .await?
             .remove(0);
     }
-    let success = match &profile.auth {
+    let result = match &profile.auth {
         AuthMethod::Password => ssh
             .authenticate_password(&profile.username, secret.expose())
             .await
-            .map_err(|_| "Authentication transport failed")?
-            .success(),
+            .map_err(|_| "Authentication transport failed")?,
         AuthMethod::None => ssh
             .authenticate_none(&profile.username)
             .await
-            .map_err(|_| "Authentication transport failed")?
-            .success(),
+            .map_err(|_| "Authentication transport failed")?,
         AuthMethod::PrivateKey { path } => {
             let path = path.clone();
             let passphrase = Secret::new(secret.expose().to_string());
@@ -129,53 +124,14 @@ pub(super) async fn authenticate(
             )
             .await
             .map_err(|_| "Authentication transport failed")?
-            .success()
         }
         AuthMethod::KeyboardInteractive => {
-            use client::KeyboardInteractiveAuthResponse as Response;
-            let mut response = ssh
-                .authenticate_keyboard_interactive_start(&profile.username, None)
-                .await
-                .map_err(|_| "Interactive authentication failed")?;
-            let mut rounds = 0;
-            loop {
-                match response {
-                    Response::Success => break true,
-                    Response::Failure { .. } => break false,
-                    Response::InfoRequest {
-                        name,
-                        instructions,
-                        prompts,
-                    } => {
-                        rounds += 1;
-                        if rounds > 16
-                            || prompts.len() > 16
-                            || instructions.len() + name.len() > 16384
-                            || prompts.iter().any(|p| p.prompt.len() > 4096)
-                        {
-                            return Err("Interactive authentication limits exceeded".into());
-                        }
-                        let answers = if prompts.is_empty() {
-                            vec![]
-                        } else {
-                            session
-                                .ask_auth(AuthPrompt {
-                                    hop: hop.clone(),
-                                    instructions: format!("{name}\n{instructions}"),
-                                    prompts: prompts
-                                        .into_iter()
-                                        .map(|p| (p.prompt, p.echo))
-                                        .collect(),
-                                })
-                                .await?
-                        };
-                        response = ssh
-                            .authenticate_keyboard_interactive_respond(
-                                answers.iter().map(|s| s.expose().to_string()).collect(),
-                            )
-                            .await
-                            .map_err(|_| "Interactive authentication failed")?;
-                    }
+            if interactive(session, ssh, &profile.username, &hop).await? {
+                client::AuthResult::Success
+            } else {
+                client::AuthResult::Failure {
+                    remaining_methods: russh::MethodSet::empty(),
+                    partial_success: false,
                 }
             }
         }
@@ -200,6 +156,7 @@ pub(super) async fn authenticate(
             }
         }
     };
+    let success = finish_auth(session, ssh, &profile.username, &hop, result).await?;
     if !success {
         return Err("Authentication rejected".into());
     }
@@ -220,7 +177,7 @@ pub(super) async fn authenticate_agent<
     ssh: &mut client::Handle<Handler>,
     user: &str,
     agent: &mut russh::keys::agent::client::AgentClient<S>,
-) -> Result<bool, String> {
+) -> Result<client::AuthResult, String> {
     let identities = agent
         .request_identities()
         .await
@@ -234,14 +191,93 @@ pub(super) async fn authenticate_agent<
         .map_err(|_| "Key negotiation failed")?
         .flatten();
     for identity in identities {
-        if ssh
+        let result = ssh
             .authenticate_publickey_with(user, identity.public_key().into_owned(), hash, agent)
             .await
-            .map_err(|_| "SSH agent signing failed")?
-            .success()
+            .map_err(|_| "SSH agent signing failed")?;
+        if result.success()
+            || matches!(
+                result,
+                client::AuthResult::Failure {
+                    partial_success: true,
+                    ..
+                }
+            )
         {
-            return Ok(true);
+            return Ok(result);
         }
     }
-    Ok(false)
+    Ok(client::AuthResult::Failure {
+        remaining_methods: russh::MethodSet::empty(),
+        partial_success: false,
+    })
+}
+async fn interactive(
+    session: &Session,
+    ssh: &mut client::Handle<Handler>,
+    user: &str,
+    hop: &HopIdentity,
+) -> Result<bool, String> {
+    use client::KeyboardInteractiveAuthResponse as Response;
+    let mut response = ssh
+        .authenticate_keyboard_interactive_start(user, None)
+        .await
+        .map_err(|_| "Interactive authentication failed")?;
+    let mut rounds = 0;
+    loop {
+        match response {
+            Response::Success => break Ok(true),
+            Response::Failure { .. } => break Ok(false),
+            Response::InfoRequest {
+                name,
+                instructions,
+                prompts,
+            } => {
+                rounds += 1;
+                if rounds > 16
+                    || prompts.len() > 16
+                    || instructions.len() + name.len() > 16384
+                    || prompts.iter().any(|p| p.prompt.len() > 4096)
+                {
+                    return Err("Interactive authentication limits exceeded".into());
+                }
+                let answers = if prompts.is_empty() {
+                    vec![]
+                } else {
+                    session
+                        .ask_auth(AuthPrompt {
+                            hop: hop.clone(),
+                            instructions: format!("{name}\n{instructions}"),
+                            prompts: prompts.into_iter().map(|p| (p.prompt, p.echo)).collect(),
+                        })
+                        .await?
+                };
+                response = ssh
+                    .authenticate_keyboard_interactive_respond(
+                        answers.iter().map(|s| s.expose().to_string()).collect(),
+                    )
+                    .await
+                    .map_err(|_| "Interactive authentication failed")?;
+            }
+        }
+    }
+}
+
+pub(super) async fn finish_auth(
+    session: &Session,
+    ssh: &mut client::Handle<Handler>,
+    user: &str,
+    hop: &HopIdentity,
+    result: client::AuthResult,
+) -> Result<bool, String> {
+    match result {
+        client::AuthResult::Success => Ok(true),
+        client::AuthResult::Failure {
+            partial_success: true,
+            remaining_methods,
+        } if remaining_methods.contains(&russh::MethodKind::KeyboardInteractive) => {
+            interactive(session, ssh, user, hop).await
+        }
+        _ => Ok(false),
+    }
 }

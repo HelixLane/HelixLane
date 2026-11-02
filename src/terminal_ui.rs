@@ -175,7 +175,10 @@ impl TerminalPane {
             .find(|s| s.profile == self.profile)
             .cloned()
             .or_else(|| {
-                if self.transport_only {
+                if self.transport_only
+                    && self.profile.transport_policy
+                        != helixlane::workspace::TransportPolicy::Independent
+                {
                     Service::global()
                         .resumable(&self.profile)
                         .into_iter()
@@ -217,7 +220,6 @@ impl TerminalPane {
                     .find(|p| p.id == self.profile.id)
                 {
                     *p = self.profile.clone();
-                    p.route = None;
                     p.route = None;
                 }
             }
@@ -439,9 +441,17 @@ impl Render for TerminalPane {
             .min_w_0()
             .min_h_0()
             .bg(rgb(p.editor));
+        let hop_label = self
+            .session
+            .as_ref()
+            .and_then(|s| s.state.lock().unwrap().hop.clone())
+            .map(|h| format!(" · {}", h.label()))
+            .unwrap_or_default();
         let status_label = match &status {
             Status::Connecting => text("Connecting…", "连接中…").to_string(),
-            Status::Authenticating => text("Authenticating…", "正在认证…").into(),
+            Status::Authenticating => {
+                format!("{}{hop_label}", text("Authenticating…", "正在认证…"))
+            }
             Status::Connected => format!(
                 "{} · #{}",
                 if terminal_status == TerminalStatus::Finished {
@@ -459,7 +469,7 @@ impl Render for TerminalPane {
                 text("Host identity requires approval", "请验证主机身份").into()
             }
             Status::Failed(e) => format!(
-                "{}: {}",
+                "{}{hop_label}: {}",
                 text("Connection failed", "连接失败"),
                 language.ssh_error(e)
             ),
@@ -874,23 +884,35 @@ impl Render for TerminalPane {
                             cx.listener(|this, _, _, cx| {
                                 use helixlane::ssh::forward::{Destination, ForwardSpec};
                                 if let Some(session) = &this.session {
-                                    let bind = this.forward_bind.read(cx).value().parse();
-                                    let port = this.forward_port.read(cx).value().parse::<u16>();
-                                    match (bind, port) {
-                                        (Ok(bind), Ok(port)) => {
-                                            let target = Destination {
-                                                host: this
-                                                    .forward_host
+                                    let spec =
+                                        this.forward_bind.read(cx).value().parse().ok().and_then(
+                                            |bind| {
+                                                if this.forward_mode == 2 {
+                                                    return Some(ForwardSpec::Socks { bind });
+                                                }
+                                                let port = this
+                                                    .forward_port
                                                     .read(cx)
                                                     .value()
-                                                    .to_string(),
-                                                port,
-                                            };
-                                            let spec = match this.forward_mode {
-                                                0 => ForwardSpec::Local { bind, target },
-                                                1 => ForwardSpec::Remote { bind, target },
-                                                _ => ForwardSpec::Socks { bind },
-                                            };
+                                                    .parse::<u16>()
+                                                    .ok()?;
+                                                let target = Destination {
+                                                    host: this
+                                                        .forward_host
+                                                        .read(cx)
+                                                        .value()
+                                                        .to_string(),
+                                                    port,
+                                                };
+                                                Some(if this.forward_mode == 0 {
+                                                    ForwardSpec::Local { bind, target }
+                                                } else {
+                                                    ForwardSpec::Remote { bind, target }
+                                                })
+                                            },
+                                        );
+                                    match spec {
+                                        Some(spec) => {
                                             Service::global().forward(session.clone(), spec);
                                         }
                                         _ => {
@@ -908,12 +930,29 @@ impl Render for TerminalPane {
                     );
                 }
                 for job in session.forwards() {
-                    let status = format!(
-                        "#{} {:?} · {:?}",
-                        job.id,
-                        job.spec,
-                        job.status.lock().unwrap()
-                    );
+                    use helixlane::ssh::forward::{ForwardSpec, ForwardStatus};
+                    let kind = match &job.spec {
+                        ForwardSpec::Local { .. } => text("Local", "本地"),
+                        ForwardSpec::Remote { .. } => text("Remote", "远程"),
+                        ForwardSpec::Socks { .. } => "SOCKS5",
+                    };
+                    let destination = match &job.spec {
+                        ForwardSpec::Local { target, .. } | ForwardSpec::Remote { target, .. } => {
+                            format!(" → {}:{}", target.host, target.port)
+                        }
+                        _ => String::new(),
+                    };
+                    let state = match &*job.status.lock().unwrap() {
+                        ForwardStatus::Starting => text("Starting…", "启动中…").to_string(),
+                        ForwardStatus::Listening(address) => {
+                            format!("{} {address}", text("Listening", "监听中"))
+                        }
+                        ForwardStatus::Stopped => text("Stopped", "已停止").into(),
+                        ForwardStatus::Failed(error) => {
+                            format!("{}: {}", text("Failed", "失败"), language.ssh_error(error))
+                        }
+                    };
+                    let status = format!("#{} {kind} · {state}{destination}", job.id);
                     network = network.child(
                         row()
                             .gap_2()

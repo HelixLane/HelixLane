@@ -278,6 +278,10 @@ impl Session {
         }
     }
     pub fn disconnect(&self) {
+        // Disconnect is explicitly transport-level, including reused PTYs.
+        if let Some(owner) = &self.owner {
+            owner.disconnect();
+        }
         if let Some(stop) = self.stop.lock().unwrap().take() {
             let _ = stop.send(());
         }
@@ -305,6 +309,7 @@ struct Handler {
     session: Arc<Session>,
     keys: PathBuf,
     profile: ConnectionProfile,
+    destination: bool,
 }
 impl client::Handler for Handler {
     type Error = russh::Error;
@@ -318,6 +323,9 @@ impl client::Handler for Handler {
         reply: client::ChannelOpenHandle,
         _: &mut client::Session,
     ) -> Result<(), Self::Error> {
+        if !self.destination {
+            return Ok(());
+        }
         let sender = self
             .session
             .remote_forwards
@@ -438,6 +446,7 @@ async fn run(
             session: session.clone(),
             keys: keys.clone(),
             profile: profile.clone(),
+            destination: index + 1 == total,
         };
         let config = Arc::new(client::Config {
             keepalive_interval: Some(Duration::from_secs(30)),
@@ -526,6 +535,10 @@ async fn connected(
     } else {
         (None, None)
     };
+    let mut terminal_lease = writer.as_ref().map(|writer| channel::TerminalLease {
+        writer: writer.clone(),
+        permit: terminal_permit.take(),
+    });
     // The writer is owned by the terminal channel, independently of the
     // transport owner/control loop. Dropping it cancels a blocked channel write.
     let mut writing = writer.as_ref().map(|writer| {
@@ -576,11 +589,11 @@ async fn connected(
                 Some(ChannelMsg::ExitStatus {exit_status})=>{let mut state=session.state.lock().unwrap();state.exit_status=Some(exit_status);state.revision+=1;},
                 Some(ChannelMsg::Eof)=>{let mut state=session.state.lock().unwrap();state.remote_eof=true;state.revision+=1;},
                 Some(ChannelMsg::Failure) => {
-                    reader=None;writer=None;writing=None;terminal_permit.take();
+                    reader=None;writer=None;writing=None;terminal_lease.take();
                     session.terminal_finished(Some("Server refused PTY or shell (SFTP-only hosts need the SFTP view)".into()));
                 },
                 Some(ChannelMsg::Close) | None => {
-                    reader=None;writer=None;writing=None;terminal_permit.take();session.terminal_finished(None);
+                    reader=None;writer=None;writing=None;terminal_lease.take();session.terminal_finished(None);
                 },
                 _ => {}
             }

@@ -71,3 +71,45 @@ impl ConnectionProfile {
         Ok(hops)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::workspace::Workspace;
+    #[test]
+    fn invalid_routes_are_explicit_and_saved_settings_strip_runtime_snapshots() {
+        let mut workspace = Workspace::default();
+        let mut p = workspace.resources[0].profiles[0].clone();
+        p.jump_resource = Some(999);
+        p.capture_route(&workspace.resources);
+        assert!(p.route_profiles().unwrap_err().contains("missing"));
+        workspace.resources[0].profiles[0].jump_resource = Some(workspace.resources[0].id);
+        p = workspace.resources[0].profiles[0].clone();
+        p.capture_route(&workspace.resources);
+        assert!(p.route_profiles().unwrap_err().contains("cycle"));
+        workspace.resources[0].profiles[0].jump_resource = None;
+        let mut previous = None;
+        for _ in 0..9 {
+            let id = workspace.add_resource();
+            workspace.resources.last_mut().unwrap().profiles[0].jump_resource = previous;
+            previous = Some(id);
+        }
+        p.jump_resource = previous;
+        p.capture_route(&workspace.resources);
+        assert!(p.route_profiles().unwrap_err().contains("eight hops"));
+        p.jump_resource = Some(workspace.resources[0].id);
+        workspace.resources[0].profiles[0].ephemeral = true;
+        p.capture_route(&workspace.resources);
+        assert!(p.contains_temporary_endpoint());
+        let mut settings = crate::settings::Settings::default();
+        settings.workspace.resources[0].profiles[0].route = p.route.clone();
+        assert!(
+            settings.persistent_snapshot().workspace.resources[0].profiles[0]
+                .route
+                .is_none()
+        );
+        assert!(
+            settings.workspace.resources[0].profiles[0].route.is_some(),
+            "saving mutated live task snapshot"
+        );
+    }
+}

@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicUsize;
 enum Behavior {
     Backpressure,
     StatusBeforeTail,
+    TransportCloseAfterTail,
     WaitForExecEof,
     ShellCloseDuringExec,
 }
@@ -60,7 +61,15 @@ impl server::Handler for Peer {
     ) -> Result<(), Self::Error> {
         s.channel_success(id)?;
         self.shell = Some(id);
-        if matches!(self.behavior, Behavior::StatusBeforeTail) {
+        if matches!(self.behavior, Behavior::TransportCloseAfterTail) {
+            for _ in 0..32 {
+                s.data(id, b"queued output\r\n".as_slice())?;
+            }
+            s.data(id, b"final-before-transport-close".as_slice())?;
+            s.exit_status_request(id, 9)?;
+            s.eof(id)?;
+            s.disconnect(russh::Disconnect::ByApplication, "fixture done", "en")?;
+        } else if matches!(self.behavior, Behavior::StatusBeforeTail) {
             s.exit_status_request(id, 7)?;
             s.data(id, b"tail-after-status".as_slice())?;
             s.eof(id)?;
@@ -197,7 +206,10 @@ fn exercise(behavior: Behavior, work: impl AsyncFn(&Service, Arc<Session>, Arc<A
         } else {
             service.connect(profile(port), Secret::new("correct".into()), false)
         };
-        if !matches!(behavior, Behavior::StatusBeforeTail) {
+        if !matches!(
+            behavior,
+            Behavior::StatusBeforeTail | Behavior::TransportCloseAfterTail
+        ) {
             until(|| session.state.lock().unwrap().status == Status::Connected).await;
         }
         work(&service, session.clone(), received).await;
@@ -399,4 +411,20 @@ async fn channel_data(channel: &mut Channel<client::Msg>) -> Vec<u8> {
     })
     .await
     .expect("subsystem data stalled after terminal close")
+}
+
+#[test]
+fn terminal_drains_buffered_data_when_transport_is_already_closed() {
+    exercise(Behavior::TransportCloseAfterTail, async |_, session, _| {
+        until(|| session.state.lock().unwrap().status == Status::Disconnected).await;
+        let state = session.state.lock().unwrap();
+        assert!(
+            state
+                .terminal
+                .text()
+                .contains("final-before-transport-close"),
+            "transport closed guard discarded buffered terminal data"
+        );
+        assert_eq!(state.exit_status, Some(9));
+    });
 }
