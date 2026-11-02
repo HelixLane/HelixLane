@@ -7,3 +7,5 @@ pub mod terminal;
 pub mod workspace;
 
 pub mod launch;
+
+pub mod tools;
