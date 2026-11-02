@@ -33,6 +33,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: native-${{ matrix.platform }}-1.99.1
+          cache-on-failure: true
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: |

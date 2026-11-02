@@ -79,6 +79,11 @@ impl EditLease {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).map_err(err)?;
         }
+        // Pin the validated directory's canonical identity once. Temporary roots
+        // may have aliased ancestors (e.g. macOS /var -> /private/var), while
+        // TransferSpec captures canonical source paths. All local fingerprints
+        // must use that same identity, including the immutable upload snapshot.
+        let root = std::fs::canonicalize(root).map_err(err)?;
         let local = root.join(format!(
             "edit-{}-{}",
             std::time::SystemTime::now()
@@ -239,6 +244,54 @@ impl EditorManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aliased_temporary_parent_keeps_two_confirmed_saves_clean() {
+        let root =
+            std::env::temp_dir().join(format!("helixlane-edit-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let actual = root.join("actual");
+        std::fs::create_dir_all(&actual).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        let original = actual.join("remote.txt");
+        std::fs::write(&original, b"original").unwrap();
+        let lease = Arc::new(
+            EditLease::download(
+                Endpoint::Local,
+                original.display().to_string(),
+                &alias.join("edits"),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!lease.saved().await.unwrap());
+        let manager = crate::tasks::TransferManager::new(1);
+        for content in [
+            b"save through alias".as_slice(),
+            b"second atomic save".as_slice(),
+        ] {
+            // Editors commonly save by replacing the regular file atomically.
+            let replacement = lease.local.with_extension("replacement");
+            std::fs::write(&replacement, content).unwrap();
+            std::fs::rename(&replacement, &lease.local).unwrap();
+            assert!(lease.saved().await.unwrap());
+            lease.upload_confirmed(manager.clone()).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while lease.uploading.load(std::sync::atomic::Ordering::Acquire) {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(*lease.last_error.lock().unwrap(), None);
+            assert_eq!(std::fs::read(&original).unwrap(), content);
+            assert!(!lease.saved().await.unwrap());
+        }
+        assert_eq!(manager.jobs().len(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn confirmed_edit_can_upload_two_saves_without_retargeting() {
         let root =
