@@ -1,16 +1,12 @@
 mod app;
 mod app_assets;
+mod application;
 mod file_ui;
 mod terminal_ui;
 mod theme;
 mod tmux_ui;
 
-use app::HelixLane;
-use gpui_kit::component::TitleBar;
-use gpui_kit::{
-    App, AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
-    application, init, open_window, px, size,
-};
+use gpui_kit::{App, KeyBinding, actions, application, init};
 
 actions!(helixlane, [Quit]);
 
@@ -133,45 +129,8 @@ fn main() -> std::process::ExitCode {
         gpui_shell::init(cx);
         init(cx);
         register_actions(cx);
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
-
-        let mut titlebar = TitleBar::title_bar_options();
-        if let Some(position) = titlebar.traffic_light_position.as_mut() {
-            // Preserve Kit's native-button alignment when increasing the toolbar height.
-            position.y += (px(theme::TOOLBAR_HEIGHT) - gpui_kit::component::TITLE_BAR_HEIGHT) * 0.5;
-        }
-
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(1440.0), px(900.0)),
-                cx,
-            ))),
-            window_min_size: Some(size(px(960.), px(640.))),
-            titlebar: Some(TitlebarOptions {
-                title: Some("HelixLane".into()),
-                ..titlebar
-            }),
-            ..TitleBar::window_options()
-        };
-
-        open_window(options, cx, |window, cx| {
-            cx.new(|cx| {
-                let mut app = HelixLane::new(window, cx);
-                if let Some(request) = request {
-                    app.dispatch_launch(request, window, cx);
-                }
-                app.listen_launch(server, window, cx);
-                app
-            })
-        })
-        .expect("Failed to open the HelixLane desktop window");
-        cx.activate(true);
+        let owner = application::ApplicationOwner::install(cx);
+        owner.start(server, request, cx);
     });
     std::process::ExitCode::SUCCESS
 }

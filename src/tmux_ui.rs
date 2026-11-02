@@ -18,6 +18,7 @@ use helixlane::{
 };
 use std::{cell::RefCell, rc::Rc, time::Duration};
 pub struct TmuxPane {
+    polling: Option<Task<()>>,
     id: u64,
     ticket: Option<helixlane::workspace::TargetTicket>,
     visible: bool,
@@ -56,29 +57,9 @@ impl TmuxPane {
         });
         let visibility =
             cx.observe_window_visibility(w, |this, v, _, _| this.window_visible = v.is_visible());
-        cx.spawn_in(w, async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(200))
-                    .await;
-                let alive = cx
-                    .update(|window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.sync_binding(window, cx);
-                            this.poll(cx);
-                            cx.notify();
-                        })
-                    })
-                    .map(|r| r.is_ok())
-                    .unwrap_or(false);
-                if !alive {
-                    break;
-                }
-            }
-        })
-        .detach();
         let ticket = settings.borrow().workspace.ticket(id);
-        Self {
+        let mut this = Self {
+            polling: None,
             id,
             ticket,
             visible: true,
@@ -105,7 +86,47 @@ impl TmuxPane {
             output: String::new(),
             error: None,
             terminal: None,
+        };
+        this.start_polling(w, cx);
+        this
+    }
+    fn start_polling(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        self.polling = Some(cx.spawn_in(w, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let alive = cx
+                    .update(|window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.sync_binding(window, cx);
+                            this.poll(cx);
+                            cx.notify();
+                        })
+                    })
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        }));
+    }
+    pub fn cancel_owned_jobs(&mut self) {
+        if let Some((_, task, _)) = &mut self.pending {
+            task.cancel();
         }
+    }
+    pub fn rebind_window(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        self.window_visible = w.is_visible();
+        self.visibility =
+            cx.observe_window_visibility(w, |this, v, _, _| this.window_visible = v.is_visible());
+        for field in [&mut self.name, &mut self.rename] {
+            let value = field.read(cx).value();
+            *field = cx.new(|cx| InputState::new(w, cx).default_value(value));
+        }
+        self.auth.update(cx, |a, cx| a.rebind_window(w, cx));
+        self.start_polling(w, cx);
     }
     pub fn set_visible(&mut self, visible: bool) {
         self.visible = visible;

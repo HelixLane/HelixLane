@@ -92,6 +92,7 @@ impl ToolProvider {
             },
             capabilities: self.capabilities,
             lease: ToolLease(Rc::new(Cell::new(true))),
+            collection: Rc::new(Cell::new(true)),
             cleanup: Vec::new(),
         })
     }
@@ -110,6 +111,7 @@ pub struct ToolInstance {
     context: ToolContext,
     capabilities: ResourceCapabilities,
     lease: ToolLease,
+    collection: Rc<Cell<bool>>,
     cleanup: Vec<Box<dyn FnOnce()>>,
 }
 impl ToolInstance {
@@ -119,9 +121,18 @@ impl ToolInstance {
     pub fn context(&self) -> &ToolContext {
         &self.context
     }
+    pub fn set_collection_active(&self, active: bool) {
+        self.collection.set(active);
+    }
+    pub fn collection_activity(&self) -> Rc<Cell<bool>> {
+        self.collection.clone()
+    }
     pub fn resource_context(&self) -> Result<ToolContext, &'static str> {
         if !self.lease.is_active() {
             return Err("Plugin is unloaded");
+        }
+        if !self.collection.get() {
+            return Err("Collection paused");
         }
         if !self.capabilities.metadata {
             return Err("Resource metadata permission denied");

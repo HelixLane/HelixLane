@@ -17,6 +17,69 @@ impl Language {
     pub fn text(self, key: &str) -> &'static str {
         let zh = self == Self::Chinese;
         match key {
+            "window" => {
+                if zh {
+                    "窗口"
+                } else {
+                    "Window"
+                }
+            }
+            "new_window" => {
+                if zh {
+                    "新窗口"
+                } else {
+                    "New window"
+                }
+            }
+            "close_window" => {
+                if zh {
+                    "关闭窗口"
+                } else {
+                    "Close window"
+                }
+            }
+            "close_view" => {
+                if zh {
+                    "关闭视图…"
+                } else {
+                    "Close view…"
+                }
+            }
+            "continue_background" => {
+                if zh {
+                    "继续后台运行"
+                } else {
+                    "Continue in background"
+                }
+            }
+            "cancel_owned" => {
+                if zh {
+                    "取消此范围任务并关闭"
+                } else {
+                    "Cancel this scope’s jobs and close"
+                }
+            }
+            "close_scope" => {
+                if zh {
+                    "仅关闭所选视图或此窗口的视图。连接不会断开；选择如何处理这些视图提交的任务。"
+                } else {
+                    "Close the selected view or this window’s views. Connections stay open. Choose what happens to jobs submitted by these views."
+                }
+            }
+            "follow_paused" => {
+                if zh {
+                    "来源窗口已关闭；跟随已暂停。选择来源窗口或将视图固定。"
+                } else {
+                    "Source window closed; Follow is paused. Choose a source window or fix the view’s target."
+                }
+            }
+            "choose_source" => {
+                if zh {
+                    "选择来源"
+                } else {
+                    "Choose source"
+                }
+            }
             "tmux" => "tmux",
             "plugin" => {
                 if zh {

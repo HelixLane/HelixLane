@@ -72,6 +72,7 @@ pub struct Session {
     stop: Mutex<Option<oneshot::Sender<()>>>,
 }
 enum Command {
+    StopTerminal,
     Resize(u32, u32),
     Open(oneshot::Sender<Result<channel::ManagedChannel, String>>),
 }
@@ -276,6 +277,10 @@ impl Session {
                 .commands
                 .try_send(Command::Resize(cols.max(2), rows.max(1)));
         }
+    }
+    /// Close only this presentation's PTY; shared SFTP/exec/forward channels stay alive.
+    pub fn stop_terminal(&self) {
+        let _ = self.commands.try_send(Command::StopTerminal);
     }
     pub fn disconnect(&self) {
         // Disconnect is explicitly transport-level, including reused PTYs.
@@ -575,6 +580,10 @@ async fn connected(
             _=openings.join_next(),if !openings.is_empty()=>{},
             _ = tokio::time::sleep(Duration::from_secs(1)), if reader.is_none() => {if ssh.is_closed() {break;}}
             command = commands.recv() => match command {
+                Some(Command::StopTerminal) => {
+                    if let Some(writer)=&writer {let _=writer.close().await;}
+                    reader=None;writer=None;writing=None;terminal_lease.take();session.terminal_finished(None);
+                }
                 Some(Command::Resize(cols,rows)) => { session.state.lock().unwrap().terminal.resize(cols as usize,rows as usize); if let Some(writer)=&writer && writer.window_change(cols,rows,0,0).await.is_err() {session.terminal_finished(Some("Terminal resize failed".into()));} }
                 Some(Command::Open(reply)) => {
                     let permit = match session.capacity.acquire(session.profile.transport_policy) {Ok(permit)=>permit,Err(error)=>{let _=reply.send(Err(error));continue;}};

@@ -489,3 +489,31 @@ async fn abandoned_recovery_validation_restores_exact_claim() {
     manager.dismiss_recovery(&id).unwrap();
     assert!(manager.recoveries().is_empty());
 }
+
+#[tokio::test]
+async fn scoped_close_cancels_only_submitting_views_jobs() {
+    let p = root("close-origin");
+    std::fs::write(p.join("source"), b"data").unwrap();
+    let spec = TransferSpec::capture(
+        Endpoint::Local,
+        p.join("source").display().to_string(),
+        Endpoint::Local,
+        p.join("target").display().to_string(),
+        Conflict::Rename,
+    )
+    .await
+    .unwrap();
+    let manager = TransferManager::new(1);
+    let a = manager.submit_paused_for(spec.clone(), Some(10));
+    let b = manager.submit_paused_for(spec, Some(20));
+    manager.cancel_views(&[10]);
+    let jobs = manager.jobs();
+    assert_eq!(
+        jobs.iter().find(|j| j.id == a).unwrap().state,
+        JobState::Cancelled
+    );
+    assert_eq!(
+        jobs.iter().find(|j| j.id == b).unwrap().state,
+        JobState::Queued
+    );
+}

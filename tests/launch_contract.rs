@@ -124,12 +124,12 @@ fn saved_follow_identity_survives_external_activation() {
     assert!(s.workspace.views.iter().any(|v| v.id == temp));
 }
 #[test]
-fn new_window_has_no_workspace_side_effects() {
+fn new_window_allocates_an_independent_destination() {
     let r = open(&["open", "alice@host", "--new-window"]);
     let mut w = helixlane::workspace::Workspace::default();
-    let before = w.clone();
-    assert!(r.apply(&mut w).is_err());
-    assert_eq!(w, before);
+    let opened = r.apply(&mut w).unwrap();
+    assert_ne!(w.owner(opened.view_id), Some(1));
+    assert_eq!(w.views.len(), 1);
 }
 #[test]
 fn explicit_auth_and_option_order_are_consistent() {

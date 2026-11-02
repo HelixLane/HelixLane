@@ -9,9 +9,9 @@ pub mod ipc;
 mod parser;
 pub use parser::{parse_native, parse_putty, parse_winscp};
 pub const MAX_FRAME: usize = 64 * 1024;
-pub const HELP: &str = "HelixLane / 连接工作台\n\nUsage / 用法:\n  helixlane open <host|user@host|ssh://...|sftp://...> [options]\n  helixlane open --resource ID [--ssh|--sftp]\n  helixlane helixlane://open?protocol=sftp&host=HOST&user=USER&path=PATH\nOptions / 选项: --ssh --sftp --user USER --port PORT --password PASSWORD\n  --key FILE --auth-none --path PATH --name NAME\n  --activate --new-view --new-window --help --version\nTemporary credentials remain in memory. URI passwords are forbidden.\n临时凭据仅保留在内存；URI 不允许包含密码。\nNew windows are unavailable in this build / 当前版本暂不支持新窗口。\n";
+pub const HELP: &str = "HelixLane / 连接工作台\n\nUsage / 用法:\n  helixlane open <host|user@host|ssh://...|sftp://...> [options]\n  helixlane open --resource ID [--ssh|--sftp]\n  helixlane helixlane://open?protocol=sftp&host=HOST&user=USER&path=PATH\nOptions / 选项: --ssh --sftp --user USER --port PORT --password PASSWORD\n  --key FILE --auth-none --path PATH --name NAME\n  --activate --new-view --new-window --help --version\nTemporary credentials remain in memory. URI passwords are forbidden.\n临时凭据仅保留在内存；URI 不允许包含密码。\n";
 pub const PUTTY_HELP: &str = "HelixLane PuTTY launcher / PuTTY 兼容启动器\nUsage / 用法: helixlane-putty [-ssh] [-P port] [-l user] [-pw password] [user@]host\n--help --version\nUnsupported / 不支持: -i, -load, remote commands, Telnet, serial.\nPasswords remain in memory / 密码仅保留在内存。\n";
-pub const WINSCP_HELP: &str = "HelixLane WinSCP launcher / WinSCP 兼容启动器\nUsage / 用法: helixlane-winscp sftp://user:encoded-password@host:port/path [/sessionname=name] [/newinstance]\n--help --version\nPercent-encode credentials and paths / 凭据和路径使用百分号编码。\nUnsupported / 不支持: /script, /command, saved session import.\nNew windows are unavailable in this build / 当前版本暂不支持新窗口。\n";
+pub const WINSCP_HELP: &str = "HelixLane WinSCP launcher / WinSCP 兼容启动器\nUsage / 用法: helixlane-winscp sftp://user:encoded-password@host:port/path [/sessionname=name] [/newinstance]\n--help --version\nPercent-encode credentials and paths / 凭据和路径使用百分号编码。\nUnsupported / 不支持: /script, /command, saved session import.\n";
 pub(crate) fn invalid() -> String {
     "Invalid launch request / 连接参数无效；参数值已隐藏".into()
 }
@@ -177,12 +177,20 @@ impl OpenRequest {
         Ok(())
     }
     pub fn apply(&self, w: &mut Workspace) -> Result<Opened, String> {
+        self.apply_in(w, 1)
+    }
+    pub fn apply_in(&self, w: &mut Workspace, window: u64) -> Result<Opened, String> {
         self.validate()?;
-        if self.mode == OpenMode::NewWindow {
-            return Err(
-                "New windows are unavailable in this build / 当前版本暂不支持新窗口".into(),
-            );
+        if let Target::Resource(id) = self.target
+            && !w.resources.iter().any(|r| r.id == id)
+        {
+            return Err("Saved resource unavailable / 已保存资源不可用".into());
         }
+        let window = if self.mode == OpenMode::NewWindow {
+            w.create_window(None)
+        } else {
+            window
+        };
         let rid = match &self.target {
             Target::Focus => return Err(invalid()),
             Target::Resource(id) => {
@@ -228,7 +236,7 @@ impl OpenRequest {
                 }
             }
         };
-        w.activate_resource(rid);
+        w.activate_resource_in(window, rid);
         let tool = match self.protocol {
             Protocol::Ssh => ToolKind::Terminal,
             Protocol::Sftp => ToolKind::Sftp,
@@ -237,7 +245,7 @@ impl OpenRequest {
             && let Some(id) = w
                 .views
                 .iter()
-                .find(|v| v.tool == tool && w.target(v.id) == Some(rid))
+                .find(|v| v.window_id == window && v.tool == tool && w.target(v.id) == Some(rid))
                 .map(|v| v.id)
         {
             w.layout.focus(id);
@@ -246,7 +254,7 @@ impl OpenRequest {
                 resource_id: rid,
             });
         }
-        let id = w.open(tool, TargetMode::Fixed(rid));
+        let id = w.open_in(window, tool, TargetMode::Fixed(rid));
         // Only newly-created external views are temporary. A reused saved Follow view
         // retains its identity, session and persistence even when following a temp host.
         if let Some(view) = w.views.iter_mut().find(|v| v.id == id) {

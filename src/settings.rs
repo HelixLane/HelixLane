@@ -103,7 +103,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             language: Language::default(),
             theme: ThemePreference::System,
             workspace: Workspace::default(),
@@ -233,6 +233,20 @@ impl Settings {
         {
             clean(value, &removed);
         }
+        for window in &mut saved.workspace.windows {
+            if window
+                .active_resource
+                .is_some_and(|id| transient.contains(&id))
+            {
+                window.active_resource = None;
+            }
+            if let Some(value) = &mut window.dock_layout {
+                clean(value, &removed);
+            }
+            if let Some(value) = &mut window.top_layout {
+                clean(value, &removed);
+            }
+        }
         saved
     }
     fn database(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
@@ -335,9 +349,12 @@ impl Settings {
             .iter()
             .map(|r| r.id)
             .chain(s.workspace.views.iter().map(|v| v.id))
+            .chain(s.workspace.windows.iter().map(|w| w.id))
             .max()
             .unwrap_or_default();
         s.workspace.next_id = s.workspace.next_id.max(maximum.saturating_add(1));
+        s.workspace.ensure_windows();
+        s.version = 2;
         Ok(s)
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {

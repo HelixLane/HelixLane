@@ -97,10 +97,14 @@ pub fn resource_module(instance: &ToolInstance, language: Language) -> HostModul
     let context = instance.resource_context();
     let lease = instance.lease();
     let labels_lease = lease.clone();
+    let activity = instance.collection_activity();
     HostModule::new("helixlane:resource")
         .function("context", move |_| {
             if !lease.is_active() {
                 return Err(HostError::new("Plugin is unloaded"));
+            }
+            if !activity.get() {
+                return Err(HostError::new("Collection paused"));
             }
             context.clone().map(context_value).map_err(HostError::new)
         })
@@ -175,6 +179,9 @@ impl NativePlugin {
             _runtime: runtime,
             _bundle: bundle,
         })
+    }
+    pub fn set_collection_active(&self, active: bool) {
+        self.instance.set_collection_active(active);
     }
     pub fn view(&self) -> Option<Entity<ScriptView>> {
         self.view.clone()

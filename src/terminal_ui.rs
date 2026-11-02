@@ -21,6 +21,7 @@ use helixlane::{
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 pub struct TerminalPane {
+    owned_forwards: Vec<Arc<helixlane::ssh::forward::ForwardJob>>,
     transport_only: bool,
     view_id: u64,
     settings: Rc<RefCell<Settings>>,
@@ -90,6 +91,7 @@ impl TerminalPane {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Find in visible screen"));
         let search_subscription = cx.observe(&search, |_, _, cx| cx.notify());
         Self {
+            owned_forwards: vec![],
             transport_only: false,
             _search_subscription: search_subscription,
             preedit: String::new(),
@@ -141,6 +143,49 @@ impl TerminalPane {
             bounds: Default::default(),
             selecting: None,
         }
+    }
+    pub fn cancel_owned_jobs(&mut self) {
+        for session in &self.sessions {
+            session.stop_terminal();
+        }
+        if let Some(session) = &self.session {
+            if !self.transport_only {
+                session.stop_terminal();
+            }
+        }
+        for job in &self.owned_forwards {
+            job.stop();
+        }
+    }
+    pub fn rebind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for field in [
+            &mut self.username,
+            &mut self.key_path,
+            &mut self.search,
+            &mut self.forward_bind,
+            &mut self.forward_host,
+            &mut self.forward_port,
+        ] {
+            let value = field.read(cx).value();
+            *field = cx.new(|cx| InputState::new(window, cx).default_value(value));
+        }
+        let password = self.password.read(cx).value();
+        self.password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .default_value(password)
+        });
+        for field in &mut self.auth_fields {
+            let value = field.read(cx).value();
+            *field = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .default_value(value)
+            });
+        }
+        self._search_subscription = cx.observe(&self.search, |_, _, cx| cx.notify());
+        self.preedit.clear();
+        self.composition_target = None;
     }
     pub fn transport_only(&mut self) {
         self.transport_only = true;
@@ -913,7 +958,9 @@ impl Render for TerminalPane {
                                         );
                                     match spec {
                                         Some(spec) => {
-                                            Service::global().forward(session.clone(), spec);
+                                            this.owned_forwards.push(
+                                                Service::global().forward(session.clone(), spec),
+                                            );
                                         }
                                         _ => {
                                             let mut state = session.state.lock().unwrap();

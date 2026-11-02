@@ -158,6 +158,9 @@ fn file_views() -> &'static Mutex<std::collections::BTreeMap<u64, std::sync::Wea
     VIEWS.get_or_init(|| Mutex::new(Default::default()))
 }
 pub struct FilePane {
+    polling: Option<Task<()>>,
+    local_scroll: ScrollHandle,
+    remote_scroll: ScrollHandle,
     id: u64,
     visible: bool,
     window_visible: bool,
@@ -214,7 +217,10 @@ impl FilePane {
             ),
         ];
 
-        let this = Self {
+        let mut this = Self {
+            polling: None,
+            local_scroll: ScrollHandle::new(),
+            remote_scroll: ScrollHandle::new(),
             id,
             visible: true,
             window_visible: window.is_visible(),
@@ -267,7 +273,16 @@ impl FilePane {
                     })
             }),
         };
-        cx.spawn_in(window, async move |this, cx| {
+        this.start_polling(window, cx);
+        file_views()
+            .lock()
+            .unwrap()
+            .insert(id, Arc::downgrade(&this.state));
+        this.refresh(false);
+        this
+    }
+    fn start_polling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.polling = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(200))
@@ -286,14 +301,45 @@ impl FilePane {
                     break;
                 }
             }
-        })
-        .detach();
-        file_views()
-            .lock()
-            .unwrap()
-            .insert(id, Arc::downgrade(&this.state));
-        this.refresh(false);
-        this
+        }));
+    }
+    pub fn rebind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_visible = window.is_visible();
+        self.visibility = cx.observe_window_visibility(window, |this, visible, _, _| {
+            this.window_visible = visible.is_visible()
+        });
+        for field in [
+            &mut self.local_path,
+            &mut self.remote_path,
+            &mut self.name,
+            &mut self.editor,
+        ] {
+            let value = field.read(cx).value();
+            *field = cx.new(|cx| InputState::new(window, cx).default_value(value));
+        }
+        self.address_subscriptions = vec![
+            cx.subscribe_in(
+                &self.local_path,
+                window,
+                |this, _, event: &InputEvent, w, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.navigate_address(false, w, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &self.remote_path,
+                window,
+                |this, _, event: &InputEvent, w, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.navigate_address(true, w, cx);
+                    }
+                },
+            ),
+        ];
+        self.auth
+            .update(cx, |auth, cx| auth.rebind_window(window, cx));
+        self.start_polling(window, cx);
     }
     pub fn launch(
         &mut self,
@@ -441,6 +487,7 @@ impl FilePane {
                 s.generation,
             )
         };
+        let origin = self.id;
         tasks::runtime().spawn(async move {
             for path in from {
                 match TransferSpec::into_directory(
@@ -453,7 +500,7 @@ impl FilePane {
                 .await
                 {
                     Ok(spec) => {
-                        TransferManager::global().submit(spec);
+                        TransferManager::global().submit_for(spec, origin);
                         state.lock().unwrap().notice = Some("Submitted".into());
                     }
                     Err(e) => {
@@ -534,6 +581,7 @@ impl FilePane {
             )
         };
         let state = self.state.clone();
+        let origin = self.id;
         tasks::runtime().spawn(async move {
             for from in paths {
                 match TransferSpec::into_directory(
@@ -546,7 +594,7 @@ impl FilePane {
                 .await
                 {
                     Ok(spec) => {
-                        TransferManager::global().submit(spec);
+                        TransferManager::global().submit_for(spec, origin);
                     }
                     Err(e) => {
                         let mut s = state.lock().unwrap();
@@ -1024,6 +1072,11 @@ impl FilePane {
         };
         let mut list = div()
             .id(("file-list", remote as usize))
+            .track_scroll(if remote {
+                &self.remote_scroll
+            } else {
+                &self.local_scroll
+            })
             .overflow_y_scroll()
             .flex_1()
             .min_h_0()

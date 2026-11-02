@@ -99,6 +99,8 @@ pub enum JobState {
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Job {
+    #[serde(skip)]
+    pub origin_view: Option<u64>,
     pub id: u64,
     pub source: String,
     pub target: String,
@@ -176,7 +178,17 @@ impl TransferManager {
         )
     }
     pub fn submit_paused(&self, spec: TransferSpec) -> u64 {
+        self.submit_paused_for(spec, None)
+    }
+    pub fn submit_paused_for(&self, spec: TransferSpec, origin_view: Option<u64>) -> u64 {
         let id = self.enqueue(spec, None);
+        self.jobs
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .job
+            .origin_view = origin_view;
         self.persist();
         id
     }
@@ -184,6 +196,7 @@ impl TransferManager {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let remote_cross = matches!((&spec.source,&spec.target),(Endpoint::Remote{transport:a,..},Endpoint::Remote{transport:b,..}) if a.id!=b.id);
         let job = Job {
+            origin_view: None,
             id,
             source: format!("{}:{}", spec.source.label(), spec.source_path),
             target: format!("{}:{}", spec.target.label(), spec.target_path),
@@ -224,6 +237,18 @@ impl TransferManager {
         let id = self.submit_paused(spec);
         self.start(id);
         id
+    }
+    pub fn submit_for(self: &Arc<Self>, spec: TransferSpec, view: u64) -> u64 {
+        let id = self.submit_paused_for(spec, Some(view));
+        self.start(id);
+        id
+    }
+    pub fn cancel_views(&self, views: &[u64]) {
+        for job in self.jobs() {
+            if job.origin_view.is_some_and(|id| views.contains(&id)) {
+                self.cancel(job.id);
+            }
+        }
     }
     pub fn start(self: &Arc<Self>, id: u64) {
         let manager = self.clone();

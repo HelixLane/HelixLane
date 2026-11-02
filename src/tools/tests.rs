@@ -139,3 +139,24 @@ fn ephemeral_view_identity_is_refused_before_plugin_instantiation() {
         "CLI-only view identities must never enter a JavaScript host context"
     );
 }
+
+#[test]
+fn collection_activity_pauses_metadata_without_revoking_user_job_lease() {
+    let mut workspace = crate::workspace::Workspace::default();
+    let id = workspace.open(
+        crate::workspace::ToolKind::Plugin,
+        crate::workspace::TargetMode::Follow,
+    );
+    let instance = ToolProvider::plugin("activity", ResourceCapabilities::metadata())
+        .instantiate(id, &workspace)
+        .unwrap();
+    let lease = instance.lease();
+    instance.set_collection_active(false);
+    assert!(instance.resource_context().is_err());
+    assert!(
+        lease.is_active(),
+        "pausing collection must not revoke submitted user jobs"
+    );
+    instance.set_collection_active(true);
+    assert!(instance.resource_context().is_ok());
+}

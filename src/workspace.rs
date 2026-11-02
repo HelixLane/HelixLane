@@ -149,6 +149,22 @@ pub fn validate_resource_form(
 use serde::{Deserialize, Serialize};
 pub type ResourceId = u64;
 pub type ViewId = u64;
+pub type WindowId = u64;
+fn primary_window() -> WindowId {
+    1
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceWindow {
+    pub id: WindowId,
+    pub layout: LayoutNode,
+    pub active_resource: Option<ResourceId>,
+    pub source: Option<WindowId>,
+    #[serde(default)]
+    pub follow_paused: bool,
+    pub dock_layout: Option<serde_json::Value>,
+    pub top_layout: Option<serde_json::Value>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AuthMethod {
     #[default]
@@ -252,6 +268,8 @@ pub enum Location {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ViewInstance {
+    #[serde(default = "primary_window")]
+    pub window_id: WindowId,
     #[serde(skip)]
     pub ephemeral: bool,
     pub id: ViewId,
@@ -339,6 +357,8 @@ pub struct TaskTarget {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Workspace {
+    #[serde(default)]
+    pub windows: Vec<WorkspaceWindow>,
     pub resources: Vec<Resource>,
     pub views: Vec<ViewInstance>,
     pub layout: LayoutNode,
@@ -348,6 +368,7 @@ pub struct Workspace {
 impl Default for Workspace {
     fn default() -> Self {
         Self {
+            windows: vec![],
             resources: (1..=4)
                 .map(|id| Resource {
                     id,
@@ -377,6 +398,164 @@ impl Default for Workspace {
     }
 }
 impl Workspace {
+    pub fn window(&self, id: WindowId) -> Option<&WorkspaceWindow> {
+        self.windows.iter().find(|w| w.id == id)
+    }
+    pub fn ensure_windows(&mut self) {
+        if self.window(1).is_none() {
+            self.windows.push(WorkspaceWindow {
+                id: 1,
+                layout: self.layout.clone(),
+                active_resource: self.active_resource,
+                source: None,
+                follow_paused: false,
+                dock_layout: None,
+                top_layout: None,
+            });
+        }
+    }
+    pub fn create_window(&mut self, source: Option<WindowId>) -> WindowId {
+        self.ensure_windows();
+        let id = self.next_id;
+        self.next_id += 1;
+        let active_resource = source
+            .and_then(|id| self.window_target(id))
+            .or(self.active_resource);
+        self.windows.push(WorkspaceWindow {
+            id,
+            layout: LayoutNode::default(),
+            active_resource,
+            source,
+            follow_paused: false,
+            dock_layout: None,
+            top_layout: None,
+        });
+        id
+    }
+    pub fn owner(&self, id: ViewId) -> Option<WindowId> {
+        self.views.iter().find(|v| v.id == id).map(|v| v.window_id)
+    }
+    pub fn window_target(&self, id: WindowId) -> Option<ResourceId> {
+        if let Some(w) = self.window(id) {
+            if w.follow_paused {
+                return None;
+            }
+            if let Some(source) = w.source {
+                return self
+                    .window(source)
+                    .filter(|w| !w.follow_paused)
+                    .and_then(|w| w.active_resource);
+            }
+            if id != 1 {
+                return w.active_resource;
+            }
+        }
+        (id == 1).then_some(self.active_resource).flatten()
+    }
+    pub fn activate_resource_in(&mut self, window: WindowId, resource: ResourceId) {
+        if window == 1 {
+            self.activate_resource(resource);
+        }
+        let previous = self.window_target(window);
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == window) {
+            w.active_resource = Some(resource);
+        }
+        if previous != self.window_target(window) {
+            let dependents: Vec<_> = self
+                .windows
+                .iter()
+                .filter(|w| w.source == Some(window) && !w.follow_paused)
+                .map(|w| w.id)
+                .collect();
+            for v in &mut self.views {
+                if v.mode == TargetMode::Follow
+                    && v.tool.resource_scoped()
+                    && (v.window_id == window || dependents.contains(&v.window_id))
+                {
+                    v.generation += 1;
+                }
+            }
+        }
+    }
+    pub fn open_in(&mut self, window: WindowId, tool: ToolKind, mode: TargetMode) -> ViewId {
+        let id = self.open(tool, mode);
+        if window != 1 {
+            self.layout.remove(id);
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == window) {
+                w.layout.add(id);
+            }
+        }
+        self.views.last_mut().unwrap().window_id = window;
+        id
+    }
+    pub fn move_to_window(&mut self, id: ViewId, destination: WindowId, location: Location) {
+        let actual = self.target(id);
+        let content = self
+            .views
+            .iter()
+            .any(|v| v.id == id && matches!(v.tool, ToolKind::Terminal | ToolKind::Sftp));
+        if content && let Some(resource) = actual {
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == destination) {
+                w.source = None;
+                w.follow_paused = false;
+            }
+            self.activate_resource_in(destination, resource);
+        }
+        self.layout.remove(id);
+        for w in &mut self.windows {
+            w.layout.remove(id);
+        }
+        if let Some(v) = self.views.iter_mut().find(|v| v.id == id) {
+            v.window_id = destination;
+            v.location = location;
+        }
+        if location == Location::Center {
+            if destination == 1 {
+                self.layout.add(id);
+            } else if let Some(w) = self.windows.iter_mut().find(|w| w.id == destination) {
+                w.layout.add(id);
+            }
+        }
+    }
+    pub fn split_in(&mut self, window: WindowId, id: ViewId, vertical: bool) {
+        if window == 1 {
+            self.split(id, vertical);
+            return;
+        }
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == window) {
+            w.layout.remove(id);
+            let old = std::mem::take(&mut w.layout);
+            w.layout = LayoutNode::Split {
+                vertical,
+                ratio: 0.5,
+                first: Box::new(old),
+                second: Box::new(LayoutNode::Tabs {
+                    views: vec![id],
+                    active: Some(id),
+                }),
+            };
+        }
+    }
+    pub fn close_window(&mut self, id: WindowId) {
+        let last = self.window_target(id);
+        for w in &mut self.windows {
+            if w.source == Some(id) {
+                w.follow_paused = true;
+                w.active_resource = last;
+            }
+        }
+        self.windows.retain(|w| w.id != id);
+        for v in &mut self.views {
+            if v.mode == TargetMode::Follow
+                && self
+                    .windows
+                    .iter()
+                    .any(|w| w.id == v.window_id && w.follow_paused)
+            {
+                v.generation += 1;
+            }
+        }
+    }
     pub fn unmounted_views(
         &self,
         mounted: &std::collections::HashMap<ViewId, Location>,
@@ -406,6 +585,7 @@ impl Workspace {
         let id = self.next_id;
         self.next_id += 1;
         self.views.push(ViewInstance {
+            window_id: 1,
             ephemeral: false,
             id,
             tool,
@@ -425,7 +605,7 @@ impl Workspace {
             return None;
         }
         let target = match v.mode {
-            TargetMode::Follow => self.active_resource,
+            TargetMode::Follow => self.window_target(v.window_id),
             TargetMode::Fixed(id) => Some(id),
         };
         target.filter(|id| self.resources.iter().any(|r| r.id == *id))
@@ -463,23 +643,28 @@ impl Workspace {
         if self.active_resource != Some(id) {
             self.active_resource = Some(id);
             for v in &mut self.views {
-                if v.tool.resource_scoped() && v.mode == TargetMode::Follow {
+                if v.tool.resource_scoped()
+                    && v.mode == TargetMode::Follow
+                    && (v.window_id == 1
+                        || self.windows.iter().any(|w| {
+                            w.id == v.window_id && w.source == Some(1) && !w.follow_paused
+                        }))
+                {
                     v.generation += 1;
                 }
             }
         }
     }
     pub fn move_view(&mut self, id: ViewId, location: Location) {
-        self.layout.remove(id);
-        if let Some(v) = self.views.iter_mut().find(|v| v.id == id) {
-            v.location = location;
-            if location == Location::Center {
-                self.layout.add(id);
-            }
+        if let Some(owner) = self.owner(id) {
+            self.move_to_window(id, owner, location);
         }
     }
     pub fn close(&mut self, id: ViewId) {
         self.layout.remove(id);
+        for window in &mut self.windows {
+            window.layout.remove(id);
+        }
         self.views.retain(|v| v.id != id);
     }
     pub fn split(&mut self, id: ViewId, vertical: bool) {
@@ -549,5 +734,70 @@ mod advanced_route_tests {
             "captured task lost its jump endpoint: {snapshot}"
         );
         assert!(!snapshot.contains("mutated"));
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    #[test]
+    fn independent_context_and_detached_source_pause() {
+        let mut w = Workspace::default();
+        let other = w.create_window(None);
+        let detached = w.create_window(Some(1));
+        let a = w.open_in(1, ToolKind::Information, TargetMode::Follow);
+        let b = w.open_in(other, ToolKind::Information, TargetMode::Follow);
+        let c = w.open_in(detached, ToolKind::Information, TargetMode::Follow);
+        w.activate_resource_in(1, 2);
+        w.activate_resource_in(other, 3);
+        assert_eq!(
+            (w.target(a), w.target(b), w.target(c)),
+            (Some(2), Some(3), Some(2))
+        );
+        w.close_window(1);
+        assert_eq!(w.target(c), None);
+        assert!(w.window(detached).unwrap().follow_paused);
+        assert_eq!(w.target(b), Some(3));
+    }
+    #[test]
+    fn moving_content_carries_actual_target_without_restarting_identity() {
+        let mut w = Workspace::default();
+        let other = w.create_window(None);
+        let a = w.open_in(1, ToolKind::Sftp, TargetMode::Follow);
+        w.views.iter_mut().find(|v| v.id == a).unwrap().session_id = Some(72);
+        let ticket = w.ticket(a);
+        w.activate_resource_in(other, 3);
+        w.move_to_window(a, other, Location::Center);
+        assert_eq!(w.target(a), Some(1));
+        assert_eq!(w.ticket(a), ticket);
+        assert_eq!(
+            w.views.iter().find(|v| v.id == a).unwrap().session_id,
+            Some(72)
+        );
+        assert_eq!(w.owner(a), Some(other));
+        let b = w.open_in(1, ToolKind::Information, TargetMode::Fixed(2));
+        w.move_to_window(b, other, Location::Right);
+        assert_eq!(
+            w.window_target(other),
+            Some(1),
+            "auxiliary focus cannot become resource context"
+        );
+    }
+    #[test]
+    fn window_layout_and_global_ids_roundtrip() {
+        let mut w = Workspace::default();
+        let other = w.create_window(None);
+        let a = w.open_in(other, ToolKind::Sftp, TargetMode::Fixed(1));
+        let b = w.open_in(other, ToolKind::Sftp, TargetMode::Fixed(2));
+        w.split_in(other, b, true);
+        assert!(matches!(
+            w.window(other).unwrap().layout,
+            LayoutNode::Split { vertical: true, .. }
+        ));
+        assert_ne!(a, b);
+        let restored: Workspace =
+            serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
+        assert_eq!(restored, w);
+        assert_eq!(restored.owner(a), Some(other));
     }
 }
