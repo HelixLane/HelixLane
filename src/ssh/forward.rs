@@ -64,8 +64,13 @@ impl ForwardJob {
         let _ = self.stop.send(true);
     }
 }
-pub(super) type RemoteRegistry =
-    Arc<Mutex<HashMap<(String, u32), mpsc::Sender<russh::Channel<client::Msg>>>>>;
+#[derive(Clone)]
+pub(super) struct RemoteRegistration {
+    pub sender: mpsc::Sender<channel::ManagedChannel>,
+    pub capacity: Arc<channel::Capacity>,
+    pub policy: crate::workspace::TransportPolicy,
+}
+pub(super) type RemoteRegistry = Arc<Mutex<HashMap<(String, u32), RemoteRegistration>>>;
 impl Session {
     pub fn forwards(&self) -> Vec<Arc<ForwardJob>> {
         let mut jobs = self
@@ -207,7 +212,14 @@ async fn run_forward(
                 if registry.contains_key(&key) {
                     return Err("Remote listener is already registered".into());
                 }
-                registry.insert(key.clone(), tx);
+                registry.insert(
+                    key.clone(),
+                    RemoteRegistration {
+                        sender: tx,
+                        capacity: session.capacity.clone(),
+                        policy: session.profile.transport_policy,
+                    },
+                );
             }
             *job.status.lock().unwrap() =
                 ForwardStatus::Listening(SocketAddr::new(bind.ip(), port));
@@ -220,21 +232,42 @@ async fn run_forward(
                     _=stopped.changed()=>break,
                     _=tokio::time::sleep(Duration::from_millis(100)),if ssh.is_closed()=>break,
                     _=streams.join_next(),if !streams.is_empty()=>{},
-                    channel=incoming.recv()=>{let Some(channel)=channel else {break};if streams.len()>=128 {let _=channel.close().await;continue;}let target=target.clone();let permit=match session.capacity.acquire(session.profile.transport_policy) {Ok(p)=>p,Err(error)=>{{let mut state=session.state.lock().unwrap();state.input_notice=Some(error);state.revision+=1;}let _=channel.close().await;continue;}};
-                        streams.spawn(async move {let mut stream=channel::ManagedChannel::new(channel,permit).into_stream();if let Ok(Ok(mut tcp))=tokio::time::timeout(Duration::from_secs(15),TcpStream::connect((target.host.as_str(),target.port))).await {let _=tokio::io::copy_bidirectional(&mut tcp,&mut stream).await;}});
+                    channel=incoming.recv()=>{let Some(channel)=channel else {break};if streams.len()>=128 {drop(channel);continue;}let target=target.clone();
+                        streams.spawn(async move {let mut stream=channel.into_stream();if let Ok(Ok(mut tcp))=tokio::time::timeout(Duration::from_secs(15),TcpStream::connect((target.host.as_str(),target.port))).await {let _=tokio::io::copy_bidirectional(&mut tcp,&mut stream).await;}});
                     }
                 }
             }
+            // Stop admission before draining; any already reserved sender carries
+            // a close-on-drop channel and cannot strand a raw accepted channel.
+            incoming.close();
             session.remote_forwards.lock().unwrap().remove(&key);
+            while let Ok(channel) = incoming.try_recv() {
+                drop(channel);
+            }
+            drop(incoming);
             streams.abort_all();
             while streams.join_next().await.is_some() {}
-            tokio::time::timeout(
+            let cancellation = tokio::time::timeout(
                 Duration::from_secs(5),
                 ssh.cancel_tcpip_forward(address, port.into()),
             )
-            .await
-            .map_err(|_| "Remote forward cancellation timed out")?
-            .map_err(|_| "Remote forward cancellation failed")?;
+            .await;
+            let failure = match cancellation {
+                Ok(Ok(())) => None,
+                Ok(Err(_)) => Some(
+                    "Remote forward cancellation failed; shared connection closed to remove listener",
+                ),
+                Err(_) => Some(
+                    "Remote forward cancellation timed out; shared connection closed to remove uncertain listener",
+                ),
+            };
+            if let Some(failure) = failure {
+                // A failed Stop must not relinquish a possibly live listener.
+                // Disconnect the owner, including sibling shared work, while
+                // retaining this specific failure on the job for the user.
+                session.disconnect();
+                return Err(failure.into());
+            }
         }
     }
     streams.abort_all();

@@ -326,18 +326,24 @@ impl client::Handler for Handler {
         if !self.destination {
             return Ok(());
         }
-        let sender = self
+        let registration = self
             .session
             .remote_forwards
             .lock()
             .unwrap()
             .get(&(address.to_string(), port))
             .cloned();
-        if let Some(sender) = sender
-            && let Ok(permit) = sender.try_reserve()
+        if let Some(registration) = registration
+            && let Ok(queue_slot) = registration.sender.try_reserve()
+            && let Ok(permit) = registration.capacity.acquire(registration.policy)
         {
+            // Admission precedes SSH confirmation. The permit and close owner
+            // accompany the channel even while it waits in the forward inbox.
+            let channel = channel::ManagedChannel::new(channel, permit);
             reply.accept().await;
-            permit.send(channel);
+            if !registration.sender.is_closed() {
+                queue_slot.send(channel);
+            }
         }
         Ok(())
     }

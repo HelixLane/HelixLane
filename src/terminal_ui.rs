@@ -953,6 +953,12 @@ impl Render for TerminalPane {
                         }
                     };
                     let status = format!("#{} {kind} · {state}{destination}", job.id);
+                    if matches!(job.spec, ForwardSpec::Remote { .. }) {
+                        network = network.child(div().text_size(px(11.)).text_color(rgb(p.muted)).child(text(
+                            "If remote Stop is not confirmed, this shared SSH connection closes, ending its other work. Independent connections stay open.",
+                            "若远程停止未获确认，此共享 SSH 连接将关闭，并结束其上的其他任务。独立连接保持打开。",
+                        )));
+                    }
                     network = network.child(
                         row()
                             .gap_2()

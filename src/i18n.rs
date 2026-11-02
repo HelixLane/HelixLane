@@ -558,6 +558,12 @@ impl Language {
             "Forward channel timed out" => "转发通道超时",
             "Forward destination refused" => "转发目标拒绝连接",
             "Remote forwarding refused" => "远程转发被拒绝",
+            "Remote forward cancellation failed; shared connection closed to remove listener" => {
+                "远程转发取消失败；已关闭共享连接以移除监听端口"
+            }
+            "Remote forward cancellation timed out; shared connection closed to remove uncertain listener" => {
+                "远程转发取消超时；已关闭共享连接以移除状态不明的监听端口"
+            }
             "Remote forward cancellation failed" => "远程转发取消失败",
             "Remote forward cancellation timed out" => "远程转发取消超时",
             "Remote listener is already registered" => "远程监听地址已注册",

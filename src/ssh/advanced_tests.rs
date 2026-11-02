@@ -6,10 +6,24 @@ use russh::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[derive(Clone, Copy, Default)]
+enum CancelBehavior {
+    #[default]
+    Accept,
+    Reject,
+    Withhold,
+}
+enum PeerEvent {
+    Ready(server::Handle),
+    Allocated(u32),
+}
 #[derive(Clone)]
 struct Peer {
     password: &'static str,
     interactive: bool,
+    cancel_behavior: CancelBehavior,
+    events: Option<mpsc::UnboundedSender<PeerEvent>>,
+    allocation_gate: Option<Arc<tokio::sync::Notify>>,
     shells: Vec<ChannelId>,
     rounds: u8,
     remote: Arc<Mutex<HashMap<u32, tokio::task::JoinHandle<()>>>>,
@@ -20,6 +34,9 @@ impl server::Server for Peer {
         Self {
             password: self.password,
             interactive: self.interactive,
+            cancel_behavior: self.cancel_behavior,
+            events: self.events.clone(),
+            allocation_gate: self.allocation_gate.clone(),
             shells: Vec::new(),
             rounds: 0,
             remote: Arc::new(Mutex::new(HashMap::new())),
@@ -35,6 +52,12 @@ impl Drop for Peer {
 }
 impl server::Handler for Peer {
     type Error = russh::Error;
+    async fn auth_succeeded(&mut self, s: &mut ServerSession) -> Result<(), Self::Error> {
+        if let Some(events) = &self.events {
+            let _ = events.send(PeerEvent::Ready(s.handle()));
+        }
+        Ok(())
+    }
     async fn auth_publickey(
         &mut self,
         _: &str,
@@ -95,8 +118,15 @@ impl server::Handler for Peer {
             }
         });
         self.remote.lock().unwrap().insert(*port, task);
-        // Hold the global response so cancellation can race allocation deterministically.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        if let Some(events) = &self.events {
+            let _ = events.send(PeerEvent::Allocated(*port));
+        }
+        // Test-only protocol gates allow deterministic admission/Stop interleavings.
+        if let Some(gate) = &self.allocation_gate {
+            gate.notified().await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
         Ok(true)
     }
     async fn cancel_tcpip_forward(
@@ -105,6 +135,14 @@ impl server::Handler for Peer {
         port: u32,
         _: &mut ServerSession,
     ) -> Result<bool, Self::Error> {
+        match self.cancel_behavior {
+            CancelBehavior::Reject => return Ok(false),
+            CancelBehavior::Withhold => {
+                tokio::time::sleep(Duration::from_secs(7)).await;
+                return Ok(false);
+            }
+            CancelBehavior::Accept => {}
+        }
         if let Some(task) = self.remote.lock().unwrap().remove(&port) {
             task.abort();
             Ok(true)
@@ -282,6 +320,9 @@ async fn peer(password: &'static str, interactive: bool) -> (u16, tokio::task::J
         Peer {
             password,
             interactive,
+            cancel_behavior: CancelBehavior::Accept,
+            events: None,
+            allocation_gate: None,
             shells: Vec::new(),
             rounds: 0,
             remote: Arc::new(Mutex::new(HashMap::new())),
@@ -1022,6 +1063,211 @@ fn incomplete_socks_handshake_expires_without_occupying_an_ssh_channel() {
         stopped(&job).await;
         session.disconnect();
         server.abort();
+    });
+    let _ = std::fs::remove_file(path);
+}
+
+async fn controlled_peer(
+    cancel_behavior: CancelBehavior,
+    allocation_gate: Option<Arc<tokio::sync::Notify>>,
+) -> (
+    u16,
+    tokio::task::JoinHandle<()>,
+    mpsc::UnboundedReceiver<PeerEvent>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (events, receiver) = mpsc::unbounded_channel();
+    let config = Arc::new(server::Config {
+        keys: vec![fixture_key()],
+        auth_rejection_time: Duration::ZERO,
+        ..Default::default()
+    });
+    let task = tokio::spawn(async move {
+        Peer {
+            password: "correct",
+            interactive: false,
+            cancel_behavior,
+            events: Some(events),
+            allocation_gate,
+            shells: Vec::new(),
+            rounds: 0,
+            remote: Arc::new(Mutex::new(HashMap::new())),
+        }
+        .run_on_socket(config, &listener)
+        .await
+        .unwrap();
+    });
+    (port, task, receiver)
+}
+async fn server_handle(events: &mut mpsc::UnboundedReceiver<PeerEvent>) -> server::Handle {
+    loop {
+        if let PeerEvent::Ready(handle) = events.recv().await.unwrap() {
+            return handle;
+        }
+    }
+}
+#[test]
+fn remote_admission_rejects_occupied_single_channel_before_confirmation() {
+    let path = path("remote-admission");
+    let service = Service::new(path.clone());
+    service.runtime.block_on(async {
+        let (port, server, mut events) = controlled_peer(CancelBehavior::Accept, None).await;
+        let mut p = profile(port);
+        p.transport_policy = crate::workspace::TransportPolicy::SingleChannel;
+        let session = service.connect(p, Secret::new("correct".into()), false);
+        wait(&session, |s| matches!(s.status, Status::HostKey { .. })).await;
+        session.trust(true);
+        wait(&session, |s| s.terminal_status == TerminalStatus::Running).await;
+        let handle = server_handle(&mut events).await;
+        let (echo_port, echo) = echo().await;
+        let job = service.forward(
+            session.clone(),
+            forward::ForwardSpec::Remote {
+                bind: forward::ForwardSpec::loopback(0),
+                target: forward::Destination {
+                    host: "127.0.0.1".into(),
+                    port: echo_port,
+                },
+            },
+        );
+        let address = listening(&job).await;
+        let attempt = handle
+            .channel_open_forwarded_tcpip("127.0.0.1", address.port().into(), "127.0.0.1", 1234)
+            .await;
+        assert!(
+            attempt.is_err(),
+            "server received channel-open confirmation while SingleChannel PTY was occupied"
+        );
+        session.input(b"original-pty-survives".to_vec());
+        wait(&session, |s| {
+            s.terminal.text().contains("original-pty-survives")
+        })
+        .await;
+        job.stop();
+        stopped(&job).await;
+        session.disconnect();
+        server.abort();
+        echo.abort();
+    });
+    let _ = std::fs::remove_file(path);
+}
+#[test]
+fn remote_stop_closes_accepted_queued_channel_and_restores_capacity() {
+    let path = path("remote-queued-stop");
+    // A separate blocking thread holds the existing state lock as a deterministic
+    // scheduler barrier after registration but before the forward worker polls its inbox.
+    let mut service = Service::new(path.clone());
+    service.runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    service.runtime.block_on(async {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (port, server, mut events) =
+            controlled_peer(CancelBehavior::Accept, Some(gate.clone())).await;
+        let mut p = profile(port);
+        p.transport_policy = crate::workspace::TransportPolicy::SingleChannel;
+        let session = service.connect_transport(p, Secret::new("correct".into()), false);
+        wait(&session, |s| matches!(s.status, Status::HostKey { .. })).await;
+        session.trust(true);
+        wait(&session, |s| s.status == Status::Connected).await;
+        let handle = server_handle(&mut events).await;
+        let job = service.forward(
+            session.clone(),
+            forward::ForwardSpec::Remote {
+                bind: forward::ForwardSpec::loopback(0),
+                target: forward::Destination {
+                    host: "127.0.0.1".into(),
+                    port: 9,
+                },
+            },
+        );
+        let allocated = loop {
+            if let PeerEvent::Allocated(port) = events.recv().await.unwrap() {
+                break port;
+            }
+        };
+        let (held, acquired) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let locked = session.clone();
+        let barrier = std::thread::spawn(move || {
+            let _guard = locked.state.lock().unwrap();
+            held.send(()).unwrap();
+            let _ = released.recv();
+        });
+        acquired.await.unwrap();
+        gate.notify_one();
+        let address = listening(&job).await;
+        assert_eq!(u32::from(address.port()), allocated);
+        let mut accepted = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.channel_open_forwarded_tcpip("127.0.0.1", allocated, "127.0.0.1", 1234),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // The protocol confirmation proves admission, while the state lock
+        // guarantees that the worker cannot yet have started a copy task.
+        job.stop();
+        release.send(()).unwrap();
+        barrier.join().unwrap();
+        stopped(&job).await;
+        let closed = tokio::time::timeout(Duration::from_millis(700), accepted.wait()).await;
+        assert!(
+            matches!(closed, Ok(None) | Ok(Some(ChannelMsg::Close))),
+            "accepted queued remote channel survived Stop"
+        );
+        assert_eq!(
+            service
+                .exec(session.clone(), b"shared-transport-survives".to_vec())
+                .result
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"shared-transport-survives"
+        );
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        session.disconnect();
+        server.abort();
+    });
+    let _ = std::fs::remove_file(path);
+}
+#[test]
+fn remote_cancel_rejection_disconnects_shared_owner_but_not_independent_transport() {
+    uncertain_remote_cancel(CancelBehavior::Reject);
+}
+#[test]
+fn remote_cancel_timeout_disconnects_shared_owner_but_not_independent_transport() {
+    uncertain_remote_cancel(CancelBehavior::Withhold);
+}
+fn uncertain_remote_cancel(behavior: CancelBehavior) {
+    let path = path("remote-cancel-uncertain");
+    let service = Service::new(path.clone());
+    service.runtime.block_on(async {
+        let (port,server,mut events)=controlled_peer(behavior,None).await;
+        let root=ready(&service,port).await;let _=server_handle(&mut events).await;
+        let child=service.connect(profile(port),Secret::new(String::new()),false);wait(&child,|s|s.terminal_status==TerminalStatus::Running).await;
+        let mut p=profile(port);p.transport_policy=crate::workspace::TransportPolicy::Independent;
+        let independent=service.connect_transport(p,Secret::new("correct".into()),false);wait(&independent,|s|s.status==Status::Connected).await;
+        let (echo_port,echo)=echo().await;
+        let job=service.forward(child.clone(),forward::ForwardSpec::Remote {bind:forward::ForwardSpec::loopback(0),target:forward::Destination {host:"127.0.0.1".into(),port:echo_port}});
+        let address=listening(&job).await;let mut stream=tokio::net::TcpStream::connect(address).await.unwrap();roundtrip(&mut stream).await;
+        let ssh=root.transport.lock().unwrap().as_ref().unwrap().clone();job.stop();
+        tokio::time::timeout(Duration::from_secs(7),async {loop {if matches!(*job.status.lock().unwrap(),forward::ForwardStatus::Failed(_)) {break;}tokio::time::sleep(Duration::from_millis(5)).await;}}).await.unwrap();
+        let failed=job.status.lock().unwrap().clone();
+        assert!(matches!(&failed,forward::ForwardStatus::Failed(error) if error.contains("shared connection closed")),"uncertain cancellation abandoned cleanup ownership: {failed:?}");
+        wait(&root,|s|s.status==Status::Disconnected).await;wait(&child,|s|s.status==Status::Disconnected).await;
+        tokio::time::timeout(Duration::from_secs(2),async {while !ssh.is_closed() {tokio::time::sleep(Duration::from_millis(5)).await;}}).await.expect("only UI state changed; transport remained open");
+        let mut byte=[0];assert!(matches!(tokio::time::timeout(Duration::from_secs(3),stream.read(&mut byte)).await.unwrap(),Ok(0)|Err(_)));
+        // Withhold delays its response past the 5s client deadline; it can
+        // process the already-closed socket again at 7s, then releases listeners.
+        tokio::time::timeout(Duration::from_secs(4),async {loop {if tokio::net::TcpStream::connect(address).await.is_err() {break;}tokio::time::sleep(Duration::from_millis(10)).await;}}).await.expect("remote listener survived transport teardown");
+        assert_eq!(service.exec(independent.clone(),b"independent-survives".to_vec()).result.await.unwrap().unwrap().bytes,b"independent-survives");
+        assert!(matches!(job.status.lock().unwrap().clone(),forward::ForwardStatus::Failed(error) if error.contains("shared connection closed")),"cleanup cause was overwritten");
+        independent.disconnect();server.abort();echo.abort();
     });
     let _ = std::fs::remove_file(path);
 }
