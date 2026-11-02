@@ -109,6 +109,23 @@ fn lock(dir: &std::path::Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 #[cfg(unix)]
+fn socket_available(dir: &std::path::Path) -> Result<bool, String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let m = match std::fs::symlink_metadata(dir.join("instance.sock")) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(failure()),
+    };
+    if !m.file_type().is_socket()
+        || m.uid() != unsafe { libc::geteuid() }
+        || m.mode() & 0o777 != 0o600
+        || m.nlink() != 1
+    {
+        return Err(failure());
+    }
+    Ok(true)
+}
+#[cfg(unix)]
 fn peer(s: &tokio::net::UnixStream) -> io::Result<()> {
     if s.peer_cred()?.uid() != unsafe { libc::geteuid() } {
         return Err(io::Error::new(
@@ -273,6 +290,9 @@ pub fn forward(r: &OpenRequest) -> Result<bool, String> {
                         .map_err(|_| failure())?;
                     write_request(&mut s, r).await.map_err(|_| failure())?;
                     return Ok(true);
+                }
+                if !socket_available(&dir)? {
+                    return Ok(false);
                 }
                 let mut s = match tokio::net::UnixStream::connect(dir.join("instance.sock")).await {
                     Ok(s) => s,
@@ -470,5 +490,23 @@ mod tests {
             }
             Err(e) => panic!("Unix probe: {e}"),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod socket_tests {
+    use super::*;
+    #[test]
+    fn absent_socket_is_absent_without_connecting_and_symlinks_are_errors() {
+        let dir = std::env::temp_dir().join(format!("helix-ipc-metadata-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        assert!(!socket_available(&dir).unwrap());
+        std::fs::write(dir.join("instance.sock"), b"not a socket").unwrap();
+        assert!(socket_available(&dir).is_err());
+        std::fs::remove_file(dir.join("instance.sock")).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing"), dir.join("instance.sock")).unwrap();
+        assert!(socket_available(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

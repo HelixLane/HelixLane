@@ -552,7 +552,7 @@ impl Render for TerminalPane {
                 },
             ));
             content = content.child(auth);
-            if self.profile.ephemeral {
+            if self.profile.ephemeral || self.profile.username.is_empty() {
                 content = content.child(
                     div()
                         .px_3()

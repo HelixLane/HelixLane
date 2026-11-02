@@ -46,7 +46,7 @@ fn main() {
                 .read_to_end(&mut bytes)
                 .is_err()
             {
-                eprintln!("HelixLane: Unable to read launch request");
+                eprintln!("HelixLane: Unable to read launch request / 无法读取启动请求");
                 std::process::exit(2);
             }
             match helixlane::launch::decode(&bytes) {

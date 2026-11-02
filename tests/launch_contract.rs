@@ -195,10 +195,16 @@ fn ephemeral_snapshot_prunes_only_temporary_nodes_and_never_live_workspace() {
     use helixlane::{settings::Settings, workspace::*};
     let mut s = Settings::default();
     let a = s.workspace.open(ToolKind::Terminal, TargetMode::Fixed(1));
-    let temp = open(&["open", "alice@host", "--new-view"])
-        .apply(&mut s.workspace)
-        .unwrap()
-        .view_id;
+    let temp = open(&[
+        "open",
+        "launch-private-user@launch-private-host.invalid",
+        "--password",
+        "launch-private-password",
+        "--new-view",
+    ])
+    .apply(&mut s.workspace)
+    .unwrap()
+    .view_id;
     let b = s.workspace.open(ToolKind::Sftp, TargetMode::Fixed(2));
     s.dock_layout = Some(
         serde_json::json!({"panel_name":"StackPanel","children":[{"panel_name":"TabPanel","children":[{"panel_name":"helixlane.tool","info":{"panel":a}},{"panel_name":"helixlane.tool","info":{"panel":temp}},{"panel_name":"helixlane.tool","info":{"panel":b}}],"info":{"tabs":{"active_index":2}}},{"panel_name":"SavedUnrelated","children":[],"info":{"tabs":{"active_index":7}}}],"info":{"stack":{"sizes":[381.5,197.25]}}}),
@@ -223,10 +229,25 @@ fn ephemeral_snapshot_prunes_only_temporary_nodes_and_never_live_workspace() {
     ));
     s.save(&path).unwrap();
     let raw = std::fs::read(&path).unwrap();
-    assert!(!raw.windows(b"alice@host".len()).any(|v| v == b"alice@host"));
+    for canary in [
+        "launch-private-user",
+        "launch-private-host.invalid",
+        "launch-private-password",
+    ] {
+        assert!(
+            !raw.windows(canary.len()).any(|v| v == canary.as_bytes()),
+            "temporary launch data reached SQLite"
+        );
+    }
     let loaded = Settings::load(&path).unwrap();
     assert!(!loaded.workspace.views.iter().any(|v| v.id == temp));
-    assert!(!loaded.workspace.resources.iter().any(|r| r.name == "host"));
+    assert!(
+        !loaded
+            .workspace
+            .resources
+            .iter()
+            .any(|r| r.name == "launch-private-host.invalid")
+    );
     std::fs::remove_file(path).unwrap();
 }
 #[test]
@@ -259,4 +280,31 @@ fn explicit_sftp_root_path_reaches_request() {
 #[test]
 fn putty_rejects_non_host_sftp_urls() {
     assert!(parse_putty(&args(&["sftp://alice@host/a"])).is_err());
+}
+#[test]
+fn saved_resource_new_view_remains_persistent() {
+    use helixlane::settings::Settings;
+    let mut settings = Settings::default();
+    let resource = settings.workspace.resources[0].clone();
+    let request = open(&["open", "--resource", "1", "--sftp", "--new-view"]);
+    let opened = request.apply(&mut settings.workspace).unwrap();
+    assert!(
+        !settings
+            .workspace
+            .views
+            .iter()
+            .find(|view| view.id == opened.view_id)
+            .unwrap()
+            .ephemeral
+    );
+    assert_eq!(settings.workspace.resources[0], resource);
+    let snapshot = settings.persistent_snapshot();
+    assert!(
+        snapshot
+            .workspace
+            .views
+            .iter()
+            .any(|view| view.id == opened.view_id)
+    );
+    assert_eq!(snapshot.workspace.resources[0], resource);
 }

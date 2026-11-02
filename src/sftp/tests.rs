@@ -148,6 +148,50 @@ fn openssh_backend_operations_atomic_upload_external_conflict_and_sftp_only_tran
         }
         remote.remove("folder/renamed").await.unwrap();
         assert!(remote.stat("folder/renamed").await.unwrap().is_none());
+        // External endpoints remain live and usable, but neither queued nor failed
+        // transfer captures may disclose their temporary host in the disk journal.
+        let mut temporary_profile = profile.clone();
+        temporary_profile.id = 701;
+        temporary_profile.ephemeral = true;
+        let temporary =
+            service.connect_transport(temporary_profile, Secret::new(String::new()), false);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match temporary.state.lock().unwrap().status.clone() {
+                    Status::HostKey { .. } => temporary.trust(true),
+                    Status::Connected => break,
+                    Status::Failed(e) => panic!("{e}"),
+                    _ => {}
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let temporary_remote = Endpoint::connect(temporary.clone()).await.unwrap();
+        let journal = root.join("temporary-transfer-journal.json");
+        let temporary_manager = TransferManager::with_journal(1, journal.clone()).unwrap();
+        let queued = TransferSpec::capture(
+            Endpoint::Local,
+            local.display().to_string(),
+            temporary_remote,
+            "folder/temporary-target".into(),
+            Conflict::Overwrite,
+        )
+        .await
+        .unwrap();
+        let queued_id = temporary_manager.submit_paused(queued);
+        assert_eq!(temporary_manager.jobs()[0].state, JobState::Queued);
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), "[]");
+        std::fs::write(&local, b"changed after immutable submission").unwrap();
+        temporary_manager.run(queued_id).await;
+        assert!(matches!(
+            temporary_manager.jobs()[0].state,
+            JobState::Failed(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), "[]");
+        assert_eq!(temporary.state.lock().unwrap().status, Status::Connected);
+        temporary.disconnect();
         assert_eq!(session.state.lock().unwrap().status, Status::Connected);
         session.disconnect();
         server.abort();

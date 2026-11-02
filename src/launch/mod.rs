@@ -161,10 +161,10 @@ impl OpenRequest {
                 {
                     return Err(invalid());
                 }
-                if let AuthMethod::PrivateKey { path } = &c.auth {
-                    if path.is_empty() || !valid_text(path) {
-                        return Err(invalid());
-                    }
+                if let AuthMethod::PrivateKey { path } = &c.auth
+                    && (path.is_empty() || !valid_text(path))
+                {
+                    return Err(invalid());
                 }
                 if self.secret.is_some() && !matches!(c.auth, AuthMethod::Password) {
                     return Err(invalid());
@@ -228,19 +228,18 @@ impl OpenRequest {
             Protocol::Ssh => ToolKind::Terminal,
             Protocol::Sftp => ToolKind::Sftp,
         };
-        if self.mode == OpenMode::Activate {
-            if let Some(id) = w
+        if self.mode == OpenMode::Activate
+            && let Some(id) = w
                 .views
                 .iter()
                 .find(|v| v.tool == tool && w.target(v.id) == Some(rid))
                 .map(|v| v.id)
-            {
-                w.layout.focus(id);
-                return Ok(Opened {
-                    view_id: id,
-                    resource_id: rid,
-                });
-            }
+        {
+            w.layout.focus(id);
+            return Ok(Opened {
+                view_id: id,
+                resource_id: rid,
+            });
         }
         let id = w.open(tool, TargetMode::Fixed(rid));
         // Only newly-created external views are temporary. A reused saved Follow view

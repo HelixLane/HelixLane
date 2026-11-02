@@ -190,33 +190,28 @@ impl Settings {
                             index += 1;
                             keep
                         });
-                        if changed {
-                            if let Some(info) = map.get_mut("info") {
-                                if let Some(active) =
-                                    info.get_mut("tabs").and_then(|v| v.get_mut("active_index"))
-                                {
-                                    let old = active.as_u64().unwrap_or(0) as usize;
-                                    let adjusted =
-                                        kept.iter().take(old).filter(|keep| **keep).count().min(
-                                            kept.iter()
-                                                .filter(|keep| **keep)
-                                                .count()
-                                                .saturating_sub(1),
-                                        );
-                                    *active = serde_json::json!(adjusted);
-                                }
-                                if let Some(sizes) = info
-                                    .get_mut("stack")
-                                    .and_then(|v| v.get_mut("sizes"))
-                                    .and_then(|v| v.as_array_mut())
-                                {
-                                    let mut index = 0;
-                                    sizes.retain(|_| {
-                                        let keep = kept.get(index).copied().unwrap_or(false);
-                                        index += 1;
-                                        keep
-                                    });
-                                }
+                        if changed && let Some(info) = map.get_mut("info") {
+                            if let Some(active) =
+                                info.get_mut("tabs").and_then(|v| v.get_mut("active_index"))
+                            {
+                                let old = active.as_u64().unwrap_or(0) as usize;
+                                let adjusted =
+                                    kept.iter().take(old).filter(|keep| **keep).count().min(
+                                        kept.iter().filter(|keep| **keep).count().saturating_sub(1),
+                                    );
+                                *active = serde_json::json!(adjusted);
+                            }
+                            if let Some(sizes) = info
+                                .get_mut("stack")
+                                .and_then(|v| v.get_mut("sizes"))
+                                .and_then(|v| v.as_array_mut())
+                            {
+                                let mut index = 0;
+                                sizes.retain(|_| {
+                                    let keep = kept.get(index).copied().unwrap_or(false);
+                                    index += 1;
+                                    keep
+                                });
                             }
                         }
                     }
