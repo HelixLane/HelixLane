@@ -76,6 +76,7 @@ impl HelixLane {
                 settings: state.clone(),
                 owner: owner.clone(),
                 focus: cx.focus_handle(),
+                terminal: None,
             });
             map.borrow_mut().insert(id, p.clone());
             panel_handle(p)
@@ -287,6 +288,7 @@ impl HelixLane {
                 settings: self.settings.clone(),
                 owner,
                 focus: cx.focus_handle(),
+                terminal: None,
             });
             self.panels.borrow_mut().insert(id, p.clone());
             groups.push((id, DockLayout::tabs().panel_view(panel_handle(p), cx)));
@@ -348,6 +350,7 @@ impl HelixLane {
                 settings: self.settings.clone(),
                 owner,
                 focus: pcx.focus_handle(),
+                terminal: None,
             })
         });
         self.panels.borrow_mut().insert(id, panel.clone());
@@ -608,7 +611,7 @@ impl HelixLane {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(p.muted))
-                    .child(lang.text("disconnected")),
+                    .child(lang.text("workspace_status")),
             )
             .into_any_element()
     }
@@ -767,7 +770,7 @@ impl Render for HelixLane {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(p.muted))
-                    .child(language.text("disconnected")),
+                    .child(language.text("workspace_status")),
             )
             .child(
                 Button::new("settings")
@@ -910,7 +913,7 @@ impl Render for HelixLane {
                     .gap_3()
                     .text_size(px(11.))
                     .text_color(rgb(p.muted))
-                    .child(language.text("disconnected"))
+                    .child(language.text("workspace_status"))
                     .child(div().flex_1())
                     .child(format!(
                         "{} {} · {} {}",
@@ -928,11 +931,15 @@ struct ToolPanel {
     settings: Shared,
     owner: WeakEntity<HelixLane>,
     focus: FocusHandle,
+    terminal: Option<Entity<crate::terminal_ui::TerminalPane>>,
 }
 impl EventEmitter<PanelEvent> for ToolPanel {}
 impl Focusable for ToolPanel {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.terminal
+            .as_ref()
+            .map(|terminal| terminal.read(cx).focus_handle(cx))
+            .unwrap_or_else(|| self.focus.clone())
     }
 }
 impl BasePanel for ToolPanel {
@@ -1205,7 +1212,7 @@ impl ToolPanel {
     }
 }
 impl Render for ToolPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::current(cx);
         let state = self.settings.borrow();
         let language = state.language;
@@ -1300,41 +1307,34 @@ impl Render for ToolPanel {
                             profile.username, profile.host, profile.port
                         ))
                         .child(r.notes)
-                        .child(language.text("offline"));
+                        .child(language.text("connection_profile"));
                 } else {
                     info = info.child(language.text("empty"));
                 }
                 info.into_any_element()
             }
-            ToolKind::Terminal => div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .p_5()
-                .gap_4()
-                .bg(rgb(p.editor))
-                .font_family("monospace")
-                .child(
-                    div().text_color(rgb(p.accent)).child(
-                        resource
-                            .as_ref()
-                            .map(|r| {
-                                format!("ssh {}@{}", r.profiles[0].username, r.profiles[0].host)
+            ToolKind::Terminal => {
+                if let Some(profile) = resource.as_ref().and_then(|r| r.profiles.first()).cloned() {
+                    let terminal = self
+                        .terminal
+                        .get_or_insert_with(|| {
+                            cx.new(|cx| {
+                                crate::terminal_ui::TerminalPane::new(
+                                    self.id,
+                                    profile.clone(),
+                                    self.settings.clone(),
+                                    window,
+                                    cx,
+                                )
                             })
-                            .unwrap_or_else(|| "ssh".into()),
-                    ),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(p.warning))
-                        .child(language.text("offline")),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(p.muted))
-                        .child(language.text("no_connection")),
-                )
-                .into_any_element(),
+                        })
+                        .clone();
+                    terminal.update(cx, |pane, cx| pane.bind(profile, window, cx));
+                    div().size_full().child(terminal).into_any_element()
+                } else {
+                    div().p_5().child(language.text("empty")).into_any_element()
+                }
+            }
             ToolKind::Sftp => {
                 let pane = |label: &'static str, path: String| {
                     div()

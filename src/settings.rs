@@ -3,8 +3,15 @@ mod tests {
     use super::*;
     #[test]
     fn partial_resource_corruption_recovers_snapshot_and_secret_references() {
-        let path =
-            std::env::temp_dir().join(format!("helix-partial-{}.sqlite", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "helix-partial-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
         let mut s = Settings::default();
         s.workspace.resources.truncate(2);
         s.workspace.resources[0].profiles[0].credential_ref = Some("keyring:host-a".into());
@@ -200,6 +207,7 @@ impl Settings {
                     port: 22,
                     username: String::new(),
                     credential_ref: None,
+                    auth: crate::workspace::AuthMethod::default(),
                     jump_resource: None,
                 });
                 s.recovery = Some("recovered_profile".into());

@@ -149,6 +149,15 @@ pub fn validate_resource_form(
 use serde::{Deserialize, Serialize};
 pub type ResourceId = u64;
 pub type ViewId = u64;
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AuthMethod {
+    #[default]
+    Password,
+    PrivateKey {
+        path: String,
+    },
+    None,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectionProfile {
     pub id: u64,
@@ -156,6 +165,8 @@ pub struct ConnectionProfile {
     pub port: u16,
     pub username: String,
     pub credential_ref: Option<String>,
+    #[serde(default)]
+    pub auth: AuthMethod,
     pub jump_resource: Option<ResourceId>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -322,6 +333,7 @@ impl Default for Workspace {
                         port: 22,
                         username: "user".into(),
                         credential_ref: None,
+                        auth: AuthMethod::default(),
                         jump_resource: None,
                     }],
                 })
@@ -470,6 +482,7 @@ impl Workspace {
                 port: 22,
                 username: String::new(),
                 credential_ref: None,
+                auth: AuthMethod::default(),
                 jump_resource: None,
             }],
         });

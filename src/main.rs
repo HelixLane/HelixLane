@@ -1,4 +1,5 @@
 mod app;
+mod terminal_ui;
 mod theme;
 
 use app::HelixLane;

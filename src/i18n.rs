@@ -206,11 +206,18 @@ impl Language {
                     "Information"
                 }
             }
-            "disconnected" => {
+            "connection_profile" => {
                 if zh {
-                    "未连接 · 演示工作台"
+                    "连接配置"
                 } else {
-                    "Disconnected · demo workbench"
+                    "Connection profile"
+                }
+            }
+            "workspace_status" => {
+                if zh {
+                    "本地工作区"
+                } else {
+                    "Local workspace"
                 }
             }
             "follow" => {
@@ -417,6 +424,55 @@ impl Language {
                 }
             }
             _ => "",
+        }
+    }
+}
+
+impl Language {
+    pub fn ssh_error(self, error: &str) -> &str {
+        if self != Self::Chinese {
+            return error;
+        }
+        match error {
+            "Terminal input not sent: shell is finished or unavailable" => {
+                "终端输入未发送：Shell 已结束或不可用"
+            }
+            "Terminal input not sent: paste exceeds 64 KiB" => "终端输入未发送：粘贴超过 64 KiB",
+            "Terminal input not sent: outbound queue is full or closed" => {
+                "终端输入未发送：发送队列已满或已关闭"
+            }
+            "SSH connection or host-key verification failed" => "SSH 连接或主机身份验证失败",
+            "Connection timed out" => "连接超时",
+            "Authentication rejected" => "认证被拒绝",
+            "Authentication transport failed" => "认证连接失败",
+            "System keychain unavailable; credential was not saved" => {
+                "系统钥匙串不可用，凭据未保存"
+            }
+            "System keychain unavailable or credential missing" => "系统钥匙串不可用或找不到凭据",
+            "Cannot read private key or incorrect passphrase" => "无法读取私钥或口令不正确",
+            "Host-key store is corrupt; repair it before connecting" => {
+                "主机密钥记录已损坏，请修复后重试"
+            }
+            "Host identity changed while approval was pending" => {
+                "等待确认期间主机身份再次发生变化"
+            }
+            "Server refused PTY or shell (SFTP-only hosts need the SFTP view)" => {
+                "服务器拒绝终端或 shell；仅支持 SFTP 的主机请使用 SFTP 视图"
+            }
+            "Shell request failed (this may be an SFTP-only host)" => {
+                "无法打开 shell，此主机可能仅支持 SFTP"
+            }
+            "PTY request failed" => "终端请求失败",
+            "Server refused a session channel" => "服务器拒绝会话通道",
+            "Terminal input failed" => "终端输入失败",
+            "Terminal resize failed" => "终端尺寸更新失败",
+            "Terminal response failed" => "终端响应失败",
+            "Jump hosts are not configured for this connection" => "此连接尚未配置跳板主机",
+            "Key negotiation failed" => "密钥协商失败",
+            "Keychain task failed" => "钥匙串操作失败",
+            "Private-key task failed" => "私钥加载失败",
+            "Missing keychain reference" => "缺少钥匙串引用",
+            _ => error,
         }
     }
 }
