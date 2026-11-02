@@ -1,4 +1,5 @@
 mod app;
+mod app_assets;
 mod file_ui;
 mod terminal_ui;
 mod theme;
@@ -8,7 +9,7 @@ use app::HelixLane;
 use gpui_kit::component::TitleBar;
 use gpui_kit::{
     App, AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
-    application, assets, init, open_window, px, size,
+    application, init, open_window, px, size,
 };
 
 actions!(helixlane, [Quit]);
@@ -112,7 +113,7 @@ fn main() -> std::process::ExitCode {
         }
     };
     let urls = server.sender();
-    let application = application().with_assets(assets::Assets);
+    let application = application().with_assets(app_assets::AppAssets);
     application.on_open_urls(move |incoming| {
         for url in incoming
             .into_iter()
