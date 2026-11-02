@@ -6,6 +6,9 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
 };
+#[cfg(test)]
+#[path = "forward_test_support.rs"]
+pub(super) mod test_support;
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Destination {
     pub host: String,

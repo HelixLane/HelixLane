@@ -1170,11 +1170,8 @@ fn remote_admission_rejects_occupied_single_channel_before_confirmation() {
 #[test]
 fn remote_stop_closes_accepted_queued_channel_and_restores_capacity() {
     let path = path("remote-queued-stop");
-    // A separate blocking thread holds the existing state lock as a deterministic
-    // scheduler barrier after registration but before the forward worker polls its inbox.
     let mut service = Service::new(path.clone());
-    service.runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    service.runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -1189,7 +1186,8 @@ fn remote_stop_closes_accepted_queued_channel_and_restores_capacity() {
         session.trust(true);
         wait(&session, |s| s.status == Status::Connected).await;
         let handle = server_handle(&mut events).await;
-        let job = service.forward(
+        let (job, paused, resume) = forward::test_support::pause_after_listening(
+            &service,
             session.clone(),
             forward::ForwardSpec::Remote {
                 bind: forward::ForwardSpec::loopback(0),
@@ -1209,19 +1207,11 @@ fn remote_stop_closes_accepted_queued_channel_and_restores_capacity() {
                 break port;
             }
         };
-        let (held, acquired) = oneshot::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        let locked = session.clone();
-        let barrier = std::thread::spawn(move || {
-            let _guard = locked.state.lock().unwrap();
-            held.send(()).unwrap();
-            released.recv_timeout(Duration::from_secs(4))
-        });
-        tokio::time::timeout(Duration::from_secs(2), acquired)
-            .await
-            .expect("fixture state-lock barrier did not start")
-            .unwrap();
         gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), paused)
+            .await
+            .expect("forward worker did not reach its test-only poll gate")
+            .unwrap();
         let address = listening(&job).await;
         assert_eq!(u32::from(address.port()), allocated);
         let mut accepted = tokio::time::timeout(
@@ -1231,14 +1221,17 @@ fn remote_stop_closes_accepted_queued_channel_and_restores_capacity() {
         .await
         .unwrap()
         .unwrap();
-        // The protocol confirmation proves admission, while the state lock
-        // guarantees that the worker cannot yet have started a copy task.
+        // The real SSH confirmation proves admission. The suspended forward
+        // future has not been polled since registration, so it cannot consume
+        // the accepted channel or start a copy task until we explicitly resume.
+        assert!(
+            session
+                .capacity
+                .acquire(crate::workspace::TransportPolicy::SingleChannel)
+                .is_err()
+        );
         job.stop();
-        release.send(()).unwrap();
-        barrier
-            .join()
-            .unwrap()
-            .expect("fixture barrier expired before Stop; queued admission was not proven");
+        resume.send(()).unwrap();
         stopped(&job).await;
         let closed = tokio::time::timeout(Duration::from_millis(700), accepted.wait()).await;
         assert!(

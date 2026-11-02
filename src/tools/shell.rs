@@ -53,12 +53,15 @@ impl Bundle {
                 .as_nanos(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
-        }
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         builder.create(&root)?;
         let bundle = Self(root);
         std::fs::write(bundle.0.join("main.js"), source)?;
@@ -221,6 +224,26 @@ impl Drop for NativePlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bundle_contains_exact_script_and_removes_private_directory_on_drop() {
+        let source = "export default 'bundle contents';\n";
+        let bundle = Bundle::new(source).unwrap();
+        let path = bundle.path().to_owned();
+        assert_eq!(
+            std::fs::read_to_string(path.join("main.js")).unwrap(),
+            source
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        drop(bundle);
+        assert!(!path.exists());
+    }
     #[test]
     fn creation_policy_restores_on_unwind_and_keeps_captured_grants() {
         let before = policy::default();
