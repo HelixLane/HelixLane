@@ -198,12 +198,23 @@ impl FilePane {
         this.refresh(false);
         this
     }
-    pub fn launch(&mut self, request: helixlane::launch::OpenRequest, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path)=request.remote_path {
-            if self.state.lock().unwrap().endpoint.is_some() { self.set_path(true,path,window,cx); }
-            else {self.state.lock().unwrap().remote=Browser::remote(path.clone());self.remote_path.update(cx,|s,cx|s.set_value(path,window,cx));}
+    pub fn launch(
+        &mut self,
+        request: helixlane::launch::OpenRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = request.remote_path {
+            if self.state.lock().unwrap().endpoint.is_some() {
+                self.set_path(true, path, window, cx);
+            } else {
+                self.state.lock().unwrap().remote = Browser::remote(path.clone());
+                self.remote_path
+                    .update(cx, |s, cx| s.set_value(path, window, cx));
+            }
         }
-        self.auth.update(cx,|auth,cx|auth.launch(request.secret,window,cx));
+        self.auth
+            .update(cx, |auth, cx| auth.launch(request.secret, window, cx));
         cx.notify();
     }
     fn sync_binding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -228,7 +239,7 @@ impl FilePane {
         if profile == self.profile && ticket == self.ticket {
             return;
         }
-        let preserve_path=self.ticket==ticket;
+        let preserve_path = self.ticket == ticket;
         self.ticket = ticket;
         self.profile = profile.clone();
         self.auth.update(cx, |a, cx| a.bind(profile, window, cx));
@@ -237,7 +248,11 @@ impl FilePane {
         s.endpoint = None;
         s.session_id = None;
         s.attempted = None;
-        let path=if preserve_path{s.remote.path.clone()}else{".".into()};
+        let path = if preserve_path {
+            s.remote.path.clone()
+        } else {
+            ".".into()
+        };
         s.remote = Browser::remote(path.clone());
         s.busy = false;
         s.error = None;
@@ -293,7 +308,7 @@ impl FilePane {
             s.attempted = selected_id;
             let generation = s.generation;
             let state = self.state.clone();
-            let initial_remote_path=s.remote.path.clone();
+            let initial_remote_path = s.remote.path.clone();
             drop(s);
             tasks::runtime().spawn(async move {
                 let result = async {

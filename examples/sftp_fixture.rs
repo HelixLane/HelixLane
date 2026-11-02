@@ -1,5 +1,5 @@
 //! Run explicitly: cargo run --no-default-features --example sftp_fixture
-//! Passwordless `fixture` account, loopback only. Approve the printed host key in the UI.
+//! Public test account `fixture`: None auth or password `correct`, loopback only. Approve the printed host key in the UI.
 //! OpenSSH SFTP backend, not full sshd. The temporary root is an initial directory, NOT a sandbox.
 #[path = "support/sftp_server.rs"]
 mod fixture;
@@ -38,7 +38,7 @@ async fn main() {
     );
     println!("HELIXLANE_FIXTURE_ROOT={}", root.display());
     println!(
-        "HELIXLANE_FIXTURE_USER=fixture (authentication None; explicit host-key trust required)"
+        "HELIXLANE_FIXTURE_USER=fixture (None auth or public test password correct; explicit host-key trust required)"
     );
     let config = std::sync::Arc::new(russh::server::Config {
         keys: vec![key],

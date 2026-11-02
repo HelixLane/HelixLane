@@ -2,6 +2,7 @@
 mod input;
 use crate::theme::*;
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
+use gpui_kit::base::Disableable;
 use gpui_kit::{
     component::{
         Sizable,
@@ -89,7 +90,11 @@ impl TerminalPane {
             view_id,
             settings,
             bound_profile: profile.clone(),
-            username: cx.new(|cx| InputState::new(window,cx).default_value(profile.username.clone()).placeholder("Username / 用户名")),
+            username: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(profile.username.clone())
+                    .placeholder("Username / 用户名")
+            }),
             launch_secret: None,
             profile,
             session: None,
@@ -132,7 +137,9 @@ impl TerminalPane {
             return;
         }
         self.bound_profile = profile.clone();
-        self.username.update(cx, |s,cx|s.set_value(profile.username.clone(),window,cx));
+        self.username.update(cx, |s, cx| {
+            s.set_value(profile.username.clone(), window, cx)
+        });
         self.launch_secret = None;
         self.profile = profile;
         self.session = self
@@ -176,8 +183,16 @@ impl TerminalPane {
     fn persist_profile(&self) {
         if self.profile.ephemeral {
             // Update the transient model for this view, without credential refs or disk writes.
-            let mut settings=self.settings.borrow_mut();
-            for resource in &mut settings.workspace.resources {if let Some(p)=resource.profiles.iter_mut().find(|p|p.id==self.profile.id){*p=self.profile.clone();}}
+            let mut settings = self.settings.borrow_mut();
+            for resource in &mut settings.workspace.resources {
+                if let Some(p) = resource
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.id == self.profile.id)
+                {
+                    *p = self.profile.clone();
+                }
+            }
             return;
         }
         let mut settings = self.settings.borrow_mut();
@@ -196,15 +211,43 @@ impl TerminalPane {
     }
     /// Consume launch auth once, using the same visible host-trust/session flow.
     pub fn launch(&mut self, secret: Option<Secret>, window: &mut Window, cx: &mut Context<Self>) {
-        if self.session.as_ref().is_some_and(|s|matches!(s.state.lock().unwrap().status,Status::Connected|Status::Connecting|Status::Authenticating|Status::HostKey{..})) {return;}
-        let supplied=secret.is_some();self.launch_secret=secret;
-        let ready=!self.profile.username.is_empty() && (supplied || self.profile.credential_ref.is_some() || matches!(self.profile.auth,AuthMethod::None|AuthMethod::PrivateKey{..}));
-        if ready {self.connect(window,cx);} else { window.focus(&self.password.read(cx).focus_handle(cx),cx);cx.notify(); }
+        if self.session.as_ref().is_some_and(|s| {
+            matches!(
+                s.state.lock().unwrap().status,
+                Status::Connected
+                    | Status::Connecting
+                    | Status::Authenticating
+                    | Status::HostKey { .. }
+            )
+        }) {
+            return;
+        }
+        let supplied = secret.is_some();
+        self.launch_secret = secret;
+        let ready = !self.profile.username.is_empty()
+            && (supplied
+                || self.profile.credential_ref.is_some()
+                || matches!(
+                    self.profile.auth,
+                    AuthMethod::None | AuthMethod::PrivateKey { .. }
+                ));
+        if ready {
+            self.connect(window, cx);
+        } else {
+            window.focus(&self.password.read(cx).focus_handle(cx), cx);
+            cx.notify();
+        }
     }
     fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.profile.username=self.username.read(cx).value().to_string();
-        if self.profile.username.trim().is_empty(){window.focus(&self.username.read(cx).focus_handle(cx),cx);return;}
-        if self.profile.ephemeral {self.remember=false;self.profile.credential_ref=None;}
+        self.profile.username = self.username.read(cx).value().to_string();
+        if self.profile.username.trim().is_empty() {
+            window.focus(&self.username.read(cx).focus_handle(cx), cx);
+            return;
+        }
+        if self.profile.ephemeral {
+            self.remember = false;
+            self.profile.credential_ref = None;
+        }
         if matches!(self.profile.auth, AuthMethod::PrivateKey { .. }) {
             self.profile.auth = AuthMethod::PrivateKey {
                 path: self.key_path.read(cx).value().to_string(),
@@ -216,7 +259,10 @@ impl TerminalPane {
         }
         self.persist_profile();
         self.bound_profile = self.profile.clone();
-        let secret = self.launch_secret.take().unwrap_or_else(||Secret::new(self.password.read(cx).value().to_string()));
+        let secret = self
+            .launch_secret
+            .take()
+            .unwrap_or_else(|| Secret::new(self.password.read(cx).value().to_string()));
         self.password
             .update(cx, |s, cx| s.set_value("", window, cx));
         let session = if self.transport_only {
@@ -506,7 +552,14 @@ impl Render for TerminalPane {
                 },
             ));
             content = content.child(auth);
-            if self.profile.ephemeral {content=content.child(div().px_3().pb_2().child(Input::new(&self.username).small()));}
+            if self.profile.ephemeral {
+                content = content.child(
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .child(Input::new(&self.username).small()),
+                );
+            }
             if matches!(self.profile.auth, AuthMethod::PrivateKey { .. }) {
                 content = content.child(
                     div()
@@ -531,6 +584,7 @@ impl Render for TerminalPane {
                                     text("Save in system keychain", "保存到系统钥匙串")
                                 },
                             )
+                            .disabled(self.profile.ephemeral)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.remember = !this.remember && !this.profile.ephemeral;
                                 cx.notify();
@@ -538,7 +592,7 @@ impl Render for TerminalPane {
                         ),
                 );
             }
-            content=content.child(div().px_3().pb_2().text_size(px(11.)).text_color(rgb(p.muted)).child(text("Credentials stay in memory unless you select the system keychain. Empty password uses an existing keychain reference.","凭据仅保留在内存中，除非选择系统钥匙串。密码留空时使用已有钥匙串引用。")));
+            content=content.child(div().px_3().pb_2().text_size(px(11.)).text_color(rgb(p.muted)).child(if self.profile.ephemeral {text("Temporary connection: credentials remain in memory.","临时连接：凭据仅保留在内存。")} else {text("Credentials stay in memory unless you select the system keychain. Empty password uses an existing keychain reference.","凭据仅保留在内存中，除非选择系统钥匙串。密码留空时使用已有钥匙串引用。")}));
         }
         if let Status::HostKey {
             fingerprint,

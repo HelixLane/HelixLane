@@ -29,6 +29,7 @@ pub struct HelixLane {
     fields: Vec<Entity<InputState>>,
     editor_error: Option<String>,
     error: Option<String>,
+    launch_error: Option<String>,
     by_type: bool,
     deleting: bool,
     show_resources: bool,
@@ -100,6 +101,7 @@ impl HelixLane {
             fields: vec![],
             editor_error: None,
             error,
+            launch_error: None,
             by_type: false,
             deleting: false,
             show_resources: true,
@@ -148,25 +150,73 @@ impl HelixLane {
             }));
         this
     }
-    pub fn dispatch_launch(&mut self, request: helixlane::launch::OpenRequest, window: &mut Window, cx: &mut Context<Self>) {
-        if request.target==helixlane::launch::Target::Focus {window.activate_window();cx.activate(true);return;}
-        let opened=match request.apply(&mut self.settings.borrow_mut().workspace){Ok(opened)=>opened,Err(error)=>{self.error=Some(error);cx.notify();return;}};
-        if !self.panels.borrow().contains_key(&opened.view_id) {self.mount(opened.view_id,window,cx);}
-        if let Some(panel)=self.panels.borrow().get(&opened.view_id).cloned(){panel.update(cx,|panel,cx|{panel.launch=Some(request);cx.notify();});}
-        self.focus_tool(opened.view_id,window,cx);
-        self.persist_layout(cx);
-        window.activate_window();cx.activate(true);cx.notify();
-    }
-    pub fn listen_launch(&mut self, server: helixlane::launch::ipc::Server, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window,async move |this,cx| {
-            // Owning server here keeps the lock/endpoint alive exactly with the window.
-            loop {cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
-                let alive=cx.update(|window,cx|this.update(cx,|this,cx|{
-                    for request in server.requests.try_iter().take(helixlane::launch::ipc::QUEUE_CAPACITY){this.dispatch_launch(request,window,cx);}
-                })).map(|r|r.is_ok()).unwrap_or(false);
-                if !alive {break;}
+    pub fn dispatch_launch(
+        &mut self,
+        request: helixlane::launch::OpenRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if request.target == helixlane::launch::Target::Focus {
+            window.activate_window();
+            cx.activate(true);
+            return;
+        }
+        self.launch_error = None;
+        let opened = match request.apply(&mut self.settings.borrow_mut().workspace) {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.launch_error = Some(error);
+                cx.notify();
+                return;
             }
-        }).detach();
+        };
+        if !self.panels.borrow().contains_key(&opened.view_id) {
+            self.mount(opened.view_id, window, cx);
+        }
+        if let Some(panel) = self.panels.borrow().get(&opened.view_id).cloned() {
+            panel.update(cx, |panel, cx| {
+                panel.launch = Some(request);
+                cx.notify();
+            });
+        }
+        self.focus_tool(opened.view_id, window, cx);
+        self.persist_layout(cx);
+        window.activate_window();
+        cx.activate(true);
+        cx.notify();
+    }
+    pub fn listen_launch(
+        &mut self,
+        server: helixlane::launch::ipc::Server,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            // Owning server here keeps the lock/endpoint alive exactly with the window.
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let alive = cx
+                    .update(|window, cx| {
+                        this.update(cx, |this, cx| {
+                            for request in server
+                                .requests
+                                .try_iter()
+                                .take(helixlane::launch::ipc::QUEUE_CAPACITY)
+                            {
+                                this.dispatch_launch(request, window, cx);
+                            }
+                        })
+                    })
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
     fn text(&self, key: &str) -> &'static str {
         self.settings.borrow().language.text(key)
@@ -897,9 +947,13 @@ impl Render for HelixLane {
                     .child(toolbar),
             );
         let message = self
-            .error
-            .as_ref()
-            .map(|detail| format!("{}: {detail}", language.text("settings_error")))
+            .launch_error
+            .clone()
+            .or_else(|| {
+                self.error
+                    .as_ref()
+                    .map(|detail| format!("{}: {detail}", language.text("settings_error")))
+            })
             .or_else(|| {
                 self.settings
                     .borrow()
@@ -1391,7 +1445,9 @@ impl Render for ToolPanel {
                         })
                         .clone();
                     terminal.update(cx, |pane, cx| pane.bind(profile, window, cx));
-                    if let Some(request)=self.launch.take(){terminal.update(cx,|pane,cx|pane.launch(request.secret,window,cx));}
+                    if let Some(request) = self.launch.take() {
+                        terminal.update(cx, |pane, cx| pane.launch(request.secret, window, cx));
+                    }
                     div().size_full().child(terminal).into_any_element()
                 } else {
                     div().p_5().child(language.text("empty")).into_any_element()
@@ -1436,7 +1492,9 @@ impl Render for ToolPanel {
                         })
                         .clone();
                     pane.update(cx, |pane, cx| pane.bind(profile, window, cx));
-                    if let Some(request)=self.launch.take(){pane.update(cx,|pane,cx|pane.launch(request,window,cx));}
+                    if let Some(request) = self.launch.take() {
+                        pane.update(cx, |pane, cx| pane.launch(request, window, cx));
+                    }
                     div().size_full().min_h_0().child(pane).into_any_element()
                 } else {
                     div().p_5().child(language.text("empty")).into_any_element()

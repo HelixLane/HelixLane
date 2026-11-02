@@ -33,6 +33,18 @@ impl server::Handler for Fixture {
             server::Auth::reject()
         })
     }
+    // Development-only public test credential; this module is never product startup code.
+    async fn auth_password(
+        &mut self,
+        user: &str,
+        password: &str,
+    ) -> Result<server::Auth, Self::Error> {
+        Ok(if user == "fixture" && password == "correct" {
+            server::Auth::Accept
+        } else {
+            server::Auth::reject()
+        })
+    }
     async fn channel_open_session(
         &mut self,
         ch: Channel<server::Msg>,

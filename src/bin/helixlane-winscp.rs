@@ -1,1 +1,12 @@
-fn main() { if let Err(error) = helixlane::launch::run_proxy(helixlane::launch::parse_winscp, helixlane::launch::WINSCP_HELP) { eprintln!("HelixLane launcher: {}", helixlane::launch::diagnostic(&error)); std::process::exit(2); } }
+fn main() {
+    if let Err(error) = helixlane::launch::run_proxy(
+        helixlane::launch::parse_winscp,
+        helixlane::launch::WINSCP_HELP,
+    ) {
+        eprintln!(
+            "HelixLane launcher: {}",
+            helixlane::launch::diagnostic(&error)
+        );
+        std::process::exit(2);
+    }
+}
