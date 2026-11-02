@@ -517,3 +517,32 @@ async fn scoped_close_cancels_only_submitting_views_jobs() {
         JobState::Queued
     );
 }
+
+#[tokio::test]
+async fn close_cancels_pending_capture_but_allows_later_new_submission() {
+    let p = root("close-pending-origin");
+    std::fs::write(p.join("source"), b"data").unwrap();
+    let manager = TransferManager::new(1);
+    let pending = manager.origin(10);
+    manager.cancel_views(&[10]);
+    let later = manager.origin(10);
+    let spec = TransferSpec::capture(
+        Endpoint::Local,
+        p.join("source").display().to_string(),
+        Endpoint::Local,
+        p.join("target").display().to_string(),
+        Conflict::Rename,
+    )
+    .await
+    .unwrap();
+    let old = manager.submit_captured(spec.clone(), &pending);
+    let new = manager.submit_captured(spec, &later);
+    assert_eq!(
+        manager.jobs().iter().find(|j| j.id == old).unwrap().state,
+        JobState::Cancelled
+    );
+    assert_ne!(
+        manager.jobs().iter().find(|j| j.id == new).unwrap().state,
+        JobState::Cancelled
+    );
+}

@@ -19,6 +19,7 @@ use helixlane::{
 use std::{cell::RefCell, rc::Rc, time::Duration};
 pub struct TmuxPane {
     polling: Option<Task<()>>,
+    window_handle: Option<AnyWindowHandle>,
     id: u64,
     ticket: Option<helixlane::workspace::TargetTicket>,
     visible: bool,
@@ -60,6 +61,7 @@ impl TmuxPane {
         let ticket = settings.borrow().workspace.ticket(id);
         let mut this = Self {
             polling: None,
+            window_handle: None,
             id,
             ticket,
             visible: true,
@@ -90,29 +92,35 @@ impl TmuxPane {
         this.start_polling(w, cx);
         this
     }
-    fn start_polling(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        self.polling = Some(cx.spawn_in(w, async move |this, cx| {
+    fn start_polling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_handle = Some(window.window_handle());
+        self.polling = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(200))
                     .await;
-                let alive = cx
-                    .update(|window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.sync_binding(window, cx);
-                            this.poll(cx);
-                            cx.notify();
-                        })
+                let Ok(handle) = this.update(cx, |this, _| this.window_handle) else {
+                    break;
+                };
+                if let Some(handle) = handle {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = this.update(cx, |this, cx| this.sync_binding(window, cx));
+                    });
+                }
+                if this
+                    .update(cx, |this, cx| {
+                        this.poll(cx);
+                        cx.notify();
                     })
-                    .map(|r| r.is_ok())
-                    .unwrap_or(false);
-                if !alive {
+                    .is_err()
+                {
                     break;
                 }
             }
         }));
     }
-    pub fn cancel_owned_jobs(&mut self) {
+    pub fn cancel_owned_jobs(&mut self, cx: &mut Context<Self>) {
+        self.auth.update(cx, |a, _| a.cancel_owned_jobs());
         if let Some((_, task, _)) = &mut self.pending {
             task.cancel();
         }
@@ -129,6 +137,9 @@ impl TmuxPane {
         self.start_polling(w, cx);
     }
     pub fn set_visible(&mut self, visible: bool) {
+        if visible && !self.visible {
+            self.last_refresh = std::time::Instant::now() - Duration::from_secs(6);
+        }
         self.visible = visible;
     }
     fn sync_binding(&mut self, w: &mut Window, cx: &mut Context<Self>) {

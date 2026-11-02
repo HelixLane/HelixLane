@@ -180,8 +180,15 @@ impl NativePlugin {
             _bundle: bundle,
         })
     }
-    pub fn set_collection_active(&self, active: bool) {
+    pub fn set_collection_active(&self, active: bool, cx: &mut App) {
+        let before = self.instance.collection_activity().get();
         self.instance.set_collection_active(active);
+        if active
+            && !before
+            && let Some(view) = &self.view
+        {
+            view.update(cx, |view, cx| view.refresh(cx));
+        }
     }
     pub fn view(&self) -> Option<Entity<ScriptView>> {
         self.view.clone()

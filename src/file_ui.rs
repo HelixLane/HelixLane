@@ -159,6 +159,7 @@ fn file_views() -> &'static Mutex<std::collections::BTreeMap<u64, std::sync::Wea
 }
 pub struct FilePane {
     polling: Option<Task<()>>,
+    window_handle: Option<AnyWindowHandle>,
     local_scroll: ScrollHandle,
     remote_scroll: ScrollHandle,
     id: u64,
@@ -219,6 +220,7 @@ impl FilePane {
 
         let mut this = Self {
             polling: None,
+            window_handle: None,
             local_scroll: ScrollHandle::new(),
             remote_scroll: ScrollHandle::new(),
             id,
@@ -282,26 +284,34 @@ impl FilePane {
         this
     }
     fn start_polling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.polling = Some(cx.spawn_in(window, async move |this, cx| {
+        self.window_handle = Some(window.window_handle());
+        self.polling = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(200))
                     .await;
-                let alive = cx
-                    .update(|window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.sync_binding(window, cx);
-                            this.poll(cx);
-                            cx.notify();
-                        })
+                let Ok(handle) = this.update(cx, |this, _| this.window_handle) else {
+                    break;
+                };
+                if let Some(handle) = handle {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = this.update(cx, |this, cx| this.sync_binding(window, cx));
+                    });
+                }
+                if this
+                    .update(cx, |this, cx| {
+                        this.poll(cx);
+                        cx.notify();
                     })
-                    .map(|result| result.is_ok())
-                    .unwrap_or(false);
-                if !alive {
+                    .is_err()
+                {
                     break;
                 }
             }
         }));
+    }
+    pub fn cancel_owned_jobs(&mut self, cx: &mut Context<Self>) {
+        self.auth.update(cx, |a, _| a.cancel_owned_jobs());
     }
     pub fn rebind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.window_visible = window.is_visible();
@@ -403,6 +413,9 @@ impl FilePane {
             .update(cx, |s, cx| s.set_value(path, window, cx));
     }
     pub fn set_visible(&mut self, visible: bool) {
+        if visible && !self.visible {
+            self.last_refresh = std::time::Instant::now() - Duration::from_secs(6);
+        }
         self.visible = visible;
     }
     pub fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -487,7 +500,7 @@ impl FilePane {
                 s.generation,
             )
         };
-        let origin = self.id;
+        let origin = TransferManager::global().origin(self.id);
         tasks::runtime().spawn(async move {
             for path in from {
                 match TransferSpec::into_directory(
@@ -500,7 +513,7 @@ impl FilePane {
                 .await
                 {
                     Ok(spec) => {
-                        TransferManager::global().submit_for(spec, origin);
+                        TransferManager::global().submit_captured(spec, &origin);
                         state.lock().unwrap().notice = Some("Submitted".into());
                     }
                     Err(e) => {
@@ -581,7 +594,7 @@ impl FilePane {
             )
         };
         let state = self.state.clone();
-        let origin = self.id;
+        let origin = TransferManager::global().origin(self.id);
         tasks::runtime().spawn(async move {
             for from in paths {
                 match TransferSpec::into_directory(
@@ -594,7 +607,7 @@ impl FilePane {
                 .await
                 {
                     Ok(spec) => {
-                        TransferManager::global().submit_for(spec, origin);
+                        TransferManager::global().submit_captured(spec, &origin);
                     }
                     Err(e) => {
                         let mut s = state.lock().unwrap();
@@ -1222,7 +1235,17 @@ impl Render for FilePane {
         let zh = lang == Language::Chinese;
         let t = |en, cn| if zh { cn } else { en };
         let mut content = div()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.settings
+                        .borrow_mut()
+                        .workspace
+                        .activate_content_view(this.id);
+                    cx.refresh_windows();
+                    cx.stop_propagation();
+                }),
+            )
             .flex()
             .flex_col()
             .size_full()

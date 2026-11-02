@@ -119,7 +119,13 @@ struct Work {
     job: Job,
     cancel: Arc<AtomicBool>,
 }
+#[derive(Clone)]
+pub struct TransferOrigin {
+    view: u64,
+    cancelled: Arc<AtomicBool>,
+}
 pub struct TransferManager {
+    origins: Mutex<BTreeMap<u64, std::sync::Weak<AtomicBool>>>,
     jobs: Mutex<BTreeMap<u64, Work>>,
     token: String,
     next: AtomicU64,
@@ -141,6 +147,7 @@ impl TransferManager {
             TOKENS.fetch_add(1, Ordering::Relaxed)
         );
         Arc::new(Self {
+            origins: Mutex::new(BTreeMap::new()),
             token,
             jobs: Mutex::new(BTreeMap::new()),
             journal: None,
@@ -238,12 +245,42 @@ impl TransferManager {
         self.start(id);
         id
     }
+    pub fn origin(&self, view: u64) -> TransferOrigin {
+        let mut origins = self.origins.lock().unwrap();
+        let cancelled = origins
+            .get(&view)
+            .and_then(|token| token.upgrade())
+            .unwrap_or_else(|| {
+                let token = Arc::new(AtomicBool::new(false));
+                origins.insert(view, Arc::downgrade(&token));
+                token
+            });
+        TransferOrigin { view, cancelled }
+    }
+    pub fn submit_captured(self: &Arc<Self>, spec: TransferSpec, origin: &TransferOrigin) -> u64 {
+        let id = self.submit_paused_for(spec, Some(origin.view));
+        if origin.cancelled.load(Ordering::Acquire) {
+            self.cancel(id);
+        } else {
+            self.start(id);
+        }
+        id
+    }
     pub fn submit_for(self: &Arc<Self>, spec: TransferSpec, view: u64) -> u64 {
         let id = self.submit_paused_for(spec, Some(view));
         self.start(id);
         id
     }
     pub fn cancel_views(&self, views: &[u64]) {
+        {
+            let mut origins = self.origins.lock().unwrap();
+            for view in views {
+                if let Some(token) = origins.remove(view).and_then(|t| t.upgrade()) {
+                    token.store(true, Ordering::Release);
+                }
+            }
+        }
+
         for job in self.jobs() {
             if job.origin_view.is_some_and(|id| views.contains(&id)) {
                 self.cancel(job.id);

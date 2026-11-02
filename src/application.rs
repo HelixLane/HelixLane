@@ -16,16 +16,22 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 pub struct ApplicationOwner(Rc<Owner>);
 struct Owner {
     settings: Shared,
+    path: RefCell<Option<std::path::PathBuf>>,
     panels: Panels,
     windows: RefCell<HashMap<WindowId, (AnyWindowHandle, WeakEntity<HelixLane>)>>,
 }
 impl Global for ApplicationOwner {}
 impl ApplicationOwner {
     pub fn install(cx: &mut App) -> Self {
-        let mut settings = Settings::load(&Settings::path()).unwrap_or_else(|error| Settings {
+        let settings = Settings::load(&Settings::path()).unwrap_or_else(|error| Settings {
             recovery: Some(error),
             ..Settings::default()
         });
+        let owner = Self::install_settings(settings, cx);
+        owner.0.path.replace(Some(Settings::path()));
+        owner
+    }
+    fn install_settings(mut settings: Settings, cx: &mut App) -> Self {
         settings.workspace.ensure_windows();
         if let Some(primary) = settings.workspace.windows.iter_mut().find(|w| w.id == 1) {
             if primary.dock_layout.is_none() {
@@ -37,6 +43,7 @@ impl ApplicationOwner {
         }
         let owner = Self(Rc::new(Owner {
             settings: Rc::new(RefCell::new(settings)),
+            path: RefCell::new(None),
             panels: Default::default(),
             windows: Default::default(),
         }));
@@ -71,7 +78,10 @@ impl ApplicationOwner {
         self.0.panels.clone()
     }
     pub fn save(&self) -> Result<(), String> {
-        self.0.settings.borrow().save(&Settings::path())
+        match self.0.path.borrow().as_ref() {
+            Some(path) => self.0.settings.borrow().save(path),
+            None => Ok(()),
+        }
     }
     pub fn register(&self, id: WindowId, handle: AnyWindowHandle, view: WeakEntity<HelixLane>) {
         self.0.windows.borrow_mut().insert(id, (handle, view));
@@ -99,12 +109,17 @@ impl ApplicationOwner {
             position.y +=
                 (px(crate::theme::TOOLBAR_HEIGHT) - gpui_kit::component::TITLE_BAR_HEIGHT) * 0.5;
         }
+        let bounds = self
+            .settings()
+            .borrow()
+            .workspace
+            .window(id)
+            .and_then(|w| w.bounds)
+            .filter(|b| b.iter().all(|n| n.is_finite()) && b[2] >= 960. && b[3] >= 640.)
+            .map(|b| Bounds::new(point(px(b[0]), px(b[1])), size(px(b[2]), px(b[3]))))
+            .unwrap_or_else(|| Bounds::centered(None, size(px(1440.), px(900.)), cx));
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(1440.), px(900.)),
-                cx,
-            ))),
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(960.), px(640.))),
             titlebar: Some(TitlebarOptions {
                 title: Some(format!("HelixLane · {id}").into()),
@@ -126,10 +141,61 @@ impl ApplicationOwner {
     }
     pub fn focus(&self, id: ViewId, cx: &mut App) {
         let window = self.0.settings.borrow().workspace.owner(id);
+        if window.and_then(|id| self.window(id)).is_none() {
+            let destination = self
+                .windows()
+                .first()
+                .copied()
+                .or_else(|| self.create(None, cx).ok());
+            if let Some(destination) = destination {
+                self.relocate(id, destination, Location::Center, cx);
+            }
+            return;
+        }
         if let Some((handle, view)) = window.and_then(|id| self.window(id)) {
             let _ = handle.update(cx, |_, w, cx| {
                 w.activate_window();
                 let _ = view.update(cx, |view, cx| view.focus_tool(id, w, cx));
+            });
+        }
+    }
+    pub fn relocate(&self, id: ViewId, destination: WindowId, location: Location, cx: &mut App) {
+        let source = self.settings().borrow().workspace.owner(id);
+        if let Some((handle, view)) = source.and_then(|id| self.window(id)) {
+            let _ = handle.update(cx, |_, w, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    if source != Some(destination) {
+                        view.move_window(id, Some(destination), w, cx);
+                    } else {
+                        view.move_tool(id, location, w, cx);
+                    }
+                });
+            });
+        } else {
+            self.settings()
+                .borrow_mut()
+                .workspace
+                .move_to_window(id, destination, location);
+        }
+        if let Some((handle, view)) = self.window(destination) {
+            let _ = handle.update(cx, |_, w, cx| {
+                let _ = view.update(cx, |view, cx| view.receive_view(id, location, w, cx));
+                w.activate_window();
+            });
+        }
+    }
+    pub fn close_active(&self, cx: &mut App) {
+        let active = cx.active_window();
+        let selected = self
+            .0
+            .windows
+            .borrow()
+            .values()
+            .find(|(h, _)| Some(*h) == active)
+            .cloned();
+        if let Some((handle, view)) = selected {
+            let _ = handle.update(cx, |_, w, cx| {
+                let _ = view.update(cx, |v, cx| v.request_close(None, w, cx));
             });
         }
     }
@@ -214,5 +280,43 @@ impl ApplicationOwner {
         })
         .detach();
         cx.activate(true);
+    }
+}
+
+#[cfg(all(test, feature = "shell-tests"))]
+mod tests {
+    use super::{ApplicationOwner, Settings, TargetMode, ToolKind};
+    use gpui_kit as gpui;
+    #[gpui::test]
+    fn registry_keeps_one_entity_when_moving_between_native_window_roots(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_shell::init(cx);
+            gpui_kit::init(cx);
+            let mut settings = Settings::default();
+            settings.workspace.ensure_windows();
+            let id = settings
+                .workspace
+                .open(ToolKind::Sftp, TargetMode::Fixed(1));
+            let other = settings.workspace.create_window(None);
+            let owner = ApplicationOwner::install_settings(settings, cx);
+            owner.open(1, cx).unwrap();
+            owner.open(other, cx).unwrap();
+            let before = owner.panels().borrow().get(&id).unwrap().entity_id();
+            let (handle, view) = owner.window(1).unwrap();
+            handle
+                .update(cx, |_, window, cx| {
+                    view.update(cx, |view, cx| view.move_window(id, Some(other), window, cx))
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                owner.panels().borrow().get(&id).unwrap().entity_id(),
+                before
+            );
+            assert_eq!(owner.settings().borrow().workspace.owner(id), Some(other));
+            assert_eq!(owner.windows().len(), 2);
+        });
     }
 }

@@ -267,7 +267,7 @@ impl Settings {
         let mut snapshot_valid = false;
         let mut s = match raw {
             Some(ref raw) => match serde_json::from_str::<Self>(raw) {
-                Ok(s) if s.version == 1 => {
+                Ok(s) if matches!(s.version, 1 | 2) => {
                     snapshot_valid = true;
                     s
                 }
@@ -376,5 +376,65 @@ impl Settings {
             .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod multiwindow_tests {
+    use super::*;
+    use crate::workspace::{TargetMode, ToolKind};
+    #[test]
+    fn temporary_references_are_removed_from_every_window_and_dock() {
+        let mut settings = Settings::default();
+        settings.workspace.ensure_windows();
+        let other = settings.workspace.create_window(None);
+        settings.workspace.resources[0].profiles[0].ephemeral = true;
+        let view = settings
+            .workspace
+            .open_in(other, ToolKind::Sftp, TargetMode::Fixed(1));
+        let record = settings
+            .workspace
+            .windows
+            .iter_mut()
+            .find(|w| w.id == other)
+            .unwrap();
+        record.active_resource = Some(1);
+        record.dock_layout = Some(
+            serde_json::json!({"panel_name":"helixlane.tool","info":{"panel":view},"children":[]}),
+        );
+        let saved = settings.persistent_snapshot();
+        assert!(!saved.workspace.views.iter().any(|v| v.id == view));
+        assert_eq!(saved.workspace.window(other).unwrap().active_resource, None);
+        let layout = saved
+            .workspace
+            .window(other)
+            .unwrap()
+            .dock_layout
+            .as_ref()
+            .unwrap();
+        assert_ne!(layout.get("panel_name").unwrap(), "helixlane.tool");
+        assert!(
+            !serde_json::to_string(&saved)
+                .unwrap()
+                .contains("host-1.example.invalid")
+        );
+    }
+    #[test]
+    fn window_geometry_and_top_extent_survive_serialization() {
+        let mut settings = Settings::default();
+        settings.workspace.ensure_windows();
+        let mut value = serde_json::to_value(&settings).unwrap();
+        value["workspace"]["windows"][0]["bounds"] = serde_json::json!([10., 20., 1100., 700.]);
+        value["workspace"]["windows"][0]["top_height"] = serde_json::json!(240.);
+        let restored: Settings = serde_json::from_value(value.clone()).unwrap();
+        let actual = serde_json::to_value(restored.persistent_snapshot()).unwrap();
+        assert_eq!(
+            actual["workspace"]["windows"][0]["bounds"],
+            value["workspace"]["windows"][0]["bounds"]
+        );
+        assert_eq!(
+            actual["workspace"]["windows"][0]["top_height"],
+            value["workspace"]["windows"][0]["top_height"]
+        );
     }
 }

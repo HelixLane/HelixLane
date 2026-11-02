@@ -8,13 +8,51 @@ mod tmux_ui;
 
 use gpui_kit::{App, KeyBinding, actions, application, init};
 
-actions!(helixlane, [Quit]);
+actions!(helixlane, [Quit, NewWindow, CloseWindow]);
 
 fn register_actions(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Quit, cx| {
+        if let Some(owner) = cx.try_global::<application::ApplicationOwner>().cloned() {
+            if owner.windows().is_empty() {
+                cx.quit();
+            } else {
+                owner.close_active(cx);
+            }
+        } else {
+            cx.quit();
+        }
+    });
+    cx.on_action(|_: &NewWindow, cx| {
+        if let Some(owner) = cx.try_global::<application::ApplicationOwner>().cloned() {
+            let _ = owner.create(None, cx);
+        }
+    });
+    cx.on_action(|_: &CloseWindow, cx| {
+        if let Some(owner) = cx.try_global::<application::ApplicationOwner>().cloned() {
+            owner.close_active(cx);
+        }
+    });
     let quit = KeyBinding::load("secondary-q", Box::new(Quit), None, false, None, cx)
         .expect("Platform quit binding must parse");
-    cx.bind_keys([quit]);
+    let new_window = KeyBinding::load(
+        "secondary-shift-n",
+        Box::new(NewWindow),
+        None,
+        false,
+        None,
+        cx,
+    )
+    .expect("new window key");
+    let close_window = KeyBinding::load(
+        "secondary-shift-w",
+        Box::new(CloseWindow),
+        None,
+        false,
+        None,
+        cx,
+    )
+    .expect("close window key");
+    cx.bind_keys([quit, new_window, close_window]);
 }
 
 #[cfg(all(test, feature = "shell-tests"))]

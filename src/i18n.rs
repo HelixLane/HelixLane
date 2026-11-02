@@ -17,6 +17,13 @@ impl Language {
     pub fn text(self, key: &str) -> &'static str {
         let zh = self == Self::Chinese;
         match key {
+            "new_fixed_view" => {
+                if zh {
+                    "在新固定视图打开"
+                } else {
+                    "Open in a new fixed view"
+                }
+            }
             "window" => {
                 if zh {
                     "窗口"

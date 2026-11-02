@@ -259,33 +259,61 @@ impl HelixLane {
         cx.activate(true);
         cx.notify();
     }
-    fn move_window(
+    pub(crate) fn receive_view(
+        &mut self,
+        id: ViewId,
+        location: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = self.panels.borrow().get(&id).cloned();
+        if let Some(panel) = panel {
+            let owner = cx.entity().downgrade();
+            panel.update(cx, |panel, cx| {
+                panel.owner = owner;
+                if let Some(p) = &panel.files {
+                    p.update(cx, |p, cx| p.rebind_window(window, cx));
+                }
+                if let Some(p) = &panel.tmux {
+                    p.update(cx, |p, cx| p.rebind_window(window, cx));
+                }
+                if let Some(p) = &panel.terminal {
+                    p.update(cx, |p, cx| p.rebind_window(window, cx));
+                }
+            });
+        }
+        self.move_tool(id, location, window, cx);
+        self.focus_tool(id, window, cx);
+    }
+    pub(crate) fn move_window(
         &mut self,
         id: ViewId,
         destination: Option<WindowId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let destination =
-            match destination {
-                Some(id) => id,
-                None => match self.application.create(
-                    if self.settings.borrow().workspace.views.iter().any(|v| {
-                        v.id == id && matches!(v.tool, ToolKind::Terminal | ToolKind::Sftp)
-                    }) {
-                        None
-                    } else {
-                        Some(self.window_id)
-                    },
-                    cx,
-                ) {
-                    Ok(id) => id,
-                    Err(error) => {
-                        self.error = Some(error);
-                        return;
-                    }
-                },
-            };
+        let source = if self
+            .settings
+            .borrow()
+            .workspace
+            .views
+            .iter()
+            .any(|v| v.id == id && matches!(v.tool, ToolKind::Terminal | ToolKind::Sftp))
+        {
+            None
+        } else {
+            Some(self.window_id)
+        };
+        let destination = match destination {
+            Some(id) => id,
+            None => match self.application.create(source, cx) {
+                Ok(id) => id,
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            },
+        };
         if destination == self.window_id {
             return;
         }
@@ -366,7 +394,7 @@ impl HelixLane {
         }
         cx.refresh_windows();
     }
-    fn request_close(
+    pub(crate) fn request_close(
         &mut self,
         view: Option<ViewId>,
         _window: &mut Window,
@@ -691,7 +719,7 @@ impl HelixLane {
         self.persist();
         cx.refresh_windows();
     }
-    fn move_tool(
+    pub(crate) fn move_tool(
         &mut self,
         id: ViewId,
         location: Location,
@@ -782,6 +810,10 @@ impl HelixLane {
                 .move_view(id, Location::Center);
             self.mount_new(id, Location::Center, window, cx);
         }
+        self.settings
+            .borrow_mut()
+            .workspace
+            .activate_content_view(id);
         if let Some(p) = self.panels.borrow().get(&id) {
             let pid = PanelId::from(p.entity_id());
             self.dock
@@ -994,13 +1026,33 @@ fn placement(location: Location) -> DockPlacement {
 }
 impl Render for HelixLane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for panel in self.panels.borrow().values() {
+            panel.update(cx, |panel, cx| panel.update_plugin_activity(cx));
+        }
+
         if self.layout_save.after_render() {
             let owner = cx.entity().downgrade();
             // Schedule from rendering, so the edited frame completes layout and
             // Kit has actual pixel measurements before a layout snapshot is taken.
-            window.on_next_frame(move |_, cx| {
+            window.on_next_frame(move |window, cx| {
                 let _ = owner.update(cx, |this, cx| {
                     if this.layout_save.after_frame() {
+                        let bounds = window.bounds();
+                        if let Some(w) = this
+                            .settings
+                            .borrow_mut()
+                            .workspace
+                            .windows
+                            .iter_mut()
+                            .find(|w| w.id == this.window_id)
+                        {
+                            w.bounds = Some([
+                                bounds.origin.x.into(),
+                                bounds.origin.y.into(),
+                                bounds.size.width.into(),
+                                bounds.size.height.into(),
+                            ]);
+                        }
                         this.snapshot_layout(cx);
                     }
                     // Reconciliation can change Services locations/counts or save errors.
@@ -1120,7 +1172,40 @@ impl Render for HelixLane {
             .any(|v| v.window_id == self.window_id && v.location == Location::Top);
         let center = if has_top {
             v_resizable("top-and-center")
-                .child(resizable_panel().size(px(180.)).child(self.top.clone()))
+                .on_resize({
+                    let owner = cx.entity().downgrade();
+                    move |state, _, cx| {
+                        let height = state.read(cx).sizes().first().map(|v| f32::from(*v));
+                        if let Some(height) = height {
+                            let _ = owner.update(cx, |this, cx| {
+                                if let Some(w) = this
+                                    .settings
+                                    .borrow_mut()
+                                    .workspace
+                                    .windows
+                                    .iter_mut()
+                                    .find(|w| w.id == this.window_id)
+                                {
+                                    w.top_height = height;
+                                }
+                                this.persist_layout(cx);
+                            });
+                        }
+                    }
+                })
+                .child(
+                    resizable_panel()
+                        .size(px(self
+                            .settings
+                            .borrow()
+                            .workspace
+                            .window(self.window_id)
+                            .map(|w| w.top_height)
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(180.)
+                            .max(100.)))
+                        .child(self.top.clone()),
+                )
                 .child(resizable_panel().child(self.dock.clone()))
                 .into_any_element()
         } else {
@@ -1143,6 +1228,43 @@ impl Render for HelixLane {
                     .bg(rgb(p.frame))
                     .child(toolbar),
             );
+        let mut drop_targets = row().h(px(26.)).px_3().gap_2();
+        for (key, location) in [
+            ("left", Location::Left),
+            ("center", Location::Center),
+            ("right", Location::Right),
+            ("top", Location::Top),
+            ("bottom", Location::Bottom),
+        ] {
+            drop_targets = drop_targets.child(
+                div()
+                    .id(("dock-drop", location as usize))
+                    .px_2()
+                    .rounded(px(4.))
+                    .text_size(px(11.))
+                    .text_color(rgb(p.muted))
+                    .child(language.text(key))
+                    .drag_over::<gpui_kit::base::dock::DragPanel>(move |style, _, _, _| {
+                        style.bg(rgb(p.selected))
+                    })
+                    .on_drop(cx.listener(
+                        move |this, drag: &gpui_kit::base::dock::DragPanel, _, cx| {
+                            let id = this
+                                .panels
+                                .borrow()
+                                .iter()
+                                .find(|(_, panel)| PanelId::from(panel.entity_id()) == drag.panel())
+                                .map(|(id, _)| *id);
+                            if let Some(id) = id {
+                                let app = this.application.clone();
+                                let destination = this.window_id;
+                                cx.defer(move |cx| app.relocate(id, destination, location, cx));
+                            }
+                        },
+                    )),
+            );
+        }
+        frame = frame.child(drop_targets);
         let message = self
             .launch_error
             .clone()
@@ -1225,19 +1347,10 @@ impl Render for HelixLane {
                                             ))
                                             .on_click(move |_, _, cx| {
                                                 let _ = owner.update(cx, |this, cx| {
-                                                    if source != this.window_id {
-                                                        if let Some(w) = this
-                                                            .settings
-                                                            .borrow_mut()
-                                                            .workspace
-                                                            .windows
-                                                            .iter_mut()
-                                                            .find(|w| w.id == this.window_id)
-                                                        {
-                                                            w.source = Some(source);
-                                                            w.follow_paused = false;
-                                                        }
-                                                    }
+                                                    this.settings
+                                                        .borrow_mut()
+                                                        .workspace
+                                                        .set_source(this.window_id, source);
                                                     this.persist();
                                                     cx.refresh_windows();
                                                 });
@@ -1296,6 +1409,7 @@ pub(crate) struct ToolPanel {
     active: bool,
     window_visible: bool,
     visibility: Option<Subscription>,
+    focus_subscription: Option<Subscription>,
     id: ViewId,
     settings: Shared,
     owner: WeakEntity<HelixLane>,
@@ -1351,36 +1465,34 @@ impl BasePanel for ToolPanel {
         self.window_visible = window.is_visible();
         self.visibility = Some(cx.observe_window_visibility(window, |this, v, _, cx| {
             this.window_visible = v.is_visible();
-            this.update_plugin_activity();
+            this.update_plugin_activity(cx);
             cx.notify();
         }));
-        self.update_plugin_activity();
+        self.update_plugin_activity(cx);
         if let Some(files) = &self.files {
             files.update(cx, |pane, _| pane.set_visible(active));
         }
         if let Some(tmux) = &self.tmux {
             tmux.update(cx, |pane, _| pane.set_visible(active));
         }
-        if active {
-            let target = {
-                let s = self.settings.borrow();
-                s.workspace
-                    .views
-                    .iter()
-                    .find(|v| v.id == self.id)
-                    .and_then(|v| match (v.tool, v.mode) {
-                        (ToolKind::Terminal | ToolKind::Sftp, TargetMode::Fixed(id)) => Some(id),
-                        _ => None,
-                    })
-            };
-            if let Some(id) = target {
-                let window_id = self.settings.borrow().workspace.owner(self.id).unwrap_or(1);
-                self.settings
-                    .borrow_mut()
-                    .workspace
-                    .activate_resource_in(window_id, id);
+        self.focus_subscription = Some(cx.on_focus_in(&self.focus, window, |this, _, cx| {
+            if this
+                .settings
+                .borrow_mut()
+                .workspace
+                .activate_content_view(this.id)
+            {
                 cx.refresh_windows();
             }
+        }));
+        if active
+            && self
+                .settings
+                .borrow_mut()
+                .workspace
+                .activate_content_view(self.id)
+        {
+            cx.refresh_windows();
         }
     }
 }
@@ -1418,6 +1530,24 @@ impl Panel for ToolPanel {
         cx: &mut Context<Self>,
     ) -> PopupMenu {
         let language = self.settings.borrow().language;
+        menu = menu.item(
+            self.menu_action("new_fixed_view", language, |this, id, w, cx| {
+                let target = {
+                    let state = this.settings.borrow();
+                    state.workspace.target(id).and_then(|target| {
+                        state
+                            .workspace
+                            .views
+                            .iter()
+                            .find(|v| v.id == id)
+                            .map(|v| (v.tool, target))
+                    })
+                };
+                if let Some((tool, target)) = target {
+                    this.open(tool, TargetMode::Fixed(target), w, cx);
+                }
+            }),
+        );
         menu = menu.label(language.text("move_to"));
         for (key, location) in [
             ("center", Location::Center),
@@ -1501,14 +1631,14 @@ impl Panel for ToolPanel {
     }
 }
 impl ToolPanel {
-    fn update_plugin_activity(&self) {
+    fn update_plugin_activity(&self, cx: &mut App) {
         let active = self.settings.borrow().workspace.should_refresh(
             self.id,
             self.active,
             !self.window_visible,
         );
         if let Some(plugin) = &self.plugin {
-            plugin.set_collection_active(active);
+            plugin.set_collection_active(active, cx);
         }
     }
     fn cancel_owned_jobs(&mut self, cx: &mut Context<Self>) {
@@ -1516,7 +1646,10 @@ impl ToolPanel {
             pane.update(cx, |pane, _| pane.cancel_owned_jobs());
         }
         if let Some(pane) = &self.tmux {
-            pane.update(cx, |pane, _| pane.cancel_owned_jobs());
+            pane.update(cx, |pane, cx| pane.cancel_owned_jobs(cx));
+        }
+        if let Some(pane) = &self.files {
+            pane.update(cx, |pane, cx| pane.cancel_owned_jobs(cx));
         }
     }
     pub(crate) fn new(
@@ -1529,6 +1662,7 @@ impl ToolPanel {
             active: true,
             window_visible: true,
             visibility: None,
+            focus_subscription: None,
             id,
             settings,
             owner,
@@ -1597,7 +1731,7 @@ impl ToolPanel {
                 Err(error) => self.plugin_error = Some(error),
             }
         }
-        self.update_plugin_activity();
+        self.update_plugin_activity(cx);
         let p = Palette::current(cx);
         let enabled = view.plugin_enabled;
         let mut content = div().flex().flex_col().size_full().min_h_0().gap_2();

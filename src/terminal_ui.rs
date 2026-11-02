@@ -21,6 +21,7 @@ use helixlane::{
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 pub struct TerminalPane {
+    owned_terminals: Vec<Arc<Session>>,
     owned_forwards: Vec<Arc<helixlane::ssh::forward::ForwardJob>>,
     transport_only: bool,
     view_id: u64,
@@ -91,6 +92,7 @@ impl TerminalPane {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Find in visible screen"));
         let search_subscription = cx.observe(&search, |_, _, cx| cx.notify());
         Self {
+            owned_terminals: vec![],
             owned_forwards: vec![],
             transport_only: false,
             _search_subscription: search_subscription,
@@ -145,13 +147,8 @@ impl TerminalPane {
         }
     }
     pub fn cancel_owned_jobs(&mut self) {
-        for session in &self.sessions {
+        for session in &self.owned_terminals {
             session.stop_terminal();
-        }
-        if let Some(session) = &self.session {
-            if !self.transport_only {
-                session.stop_terminal();
-            }
         }
         for job in &self.owned_forwards {
             job.stop();
@@ -254,7 +251,7 @@ impl TerminalPane {
         }
         cx.notify();
     }
-    fn persist_profile(&self) {
+    fn persist_profile(&self, cx: &App) {
         if self.profile.ephemeral {
             // Update the transient model for this view, without credential refs or disk writes.
             let mut settings = self.settings.borrow_mut();
@@ -281,7 +278,10 @@ impl TerminalPane {
                 p.route = None;
             }
         }
-        if let Err(error) = settings.save(&Settings::path()) {
+        drop(settings);
+        if let Some(owner) = cx.try_global::<crate::application::ApplicationOwner>()
+            && let Err(error) = owner.save()
+        {
             eprintln!("Unable to save connection profile: {error}");
         }
     }
@@ -338,7 +338,7 @@ impl TerminalPane {
         }
         self.profile
             .capture_route(&self.settings.borrow().workspace.resources);
-        self.persist_profile();
+        self.persist_profile(cx);
         self.bound_profile = self.profile.clone();
         let secret = self
             .launch_secret
@@ -351,6 +351,9 @@ impl TerminalPane {
         } else {
             Service::global().connect(self.profile.clone(), secret, self.remember)
         };
+        if !self.transport_only {
+            self.owned_terminals.push(session.clone());
+        }
         self.sessions.push(session.clone());
         if let Some(view) = self
             .settings
