@@ -7,7 +7,7 @@ for name in ['helixlane','helixlane-putty','helixlane-winscp']:
   assert 'HelixLane' in p.stdout
   if flag=='--help': assert '用法' in p.stdout
  print(name,'help/version exit0 without display; bilingual usage')
-negative=[('helixlane',['helixlane://open?host=example.invalid&password=private-test-canary']),('helixlane',['open','ssh://u:private-test-canary@example.invalid']),('helixlane-putty',['-load','private-test-canary']),('helixlane-winscp',['/script=private-test-canary'])]
+negative=[('helixlane',['open','alice@host','--password','private-test-canary','--unsupported']),('helixlane',['helixlane://open?host=example.invalid&password=private-test-canary']),('helixlane',['open','ssh://u:private-test-canary@example.invalid']),('helixlane-putty',['-load','private-test-canary']),('helixlane-winscp',['/script=private-test-canary'])]
 for name,args in negative:
  p=subprocess.run([str(bins/name),*args],env=env,capture_output=True,text=True,timeout=5)
  assert p.returncode==2 and 'private-test-canary' not in p.stdout+p.stderr
@@ -20,7 +20,15 @@ for name in ['helixlane','helixlane-putty','helixlane-winscp']:
 p=subprocess.run([str(bins/'helixlane'),'--launch-stdin'],input=b'{"private-test-canary":',env=env,capture_output=True,timeout=5)
 assert p.returncode==2 and b'private-test-canary' not in p.stdout+p.stderr
 print('main invalid stdin envelope exit2; content redacted')
-for name,args,expected in [('helixlane-putty',['-ssh','-l','alice','-pw','proxy-test-canary','host.invalid'],'proxy-test-canary'),('helixlane-winscp',['sftp://alice:c%3Ap%26%20word@host.invalid/a%20b'],'c:p& word')]:
+for payload in [b'{"password":"private-test-canary","unknown":true}', b'{"password":"private-test-canary","password":"duplicate"}', b'{"password":"private-test-canary","version":']:
+ p=subprocess.run([str(bins/'helixlane'),'--launch-stdin'],input=payload,env=env,capture_output=True,timeout=5)
+ assert p.returncode==2 and b'private-test-canary' not in p.stdout+p.stderr
+print('main parsed-password malformed/duplicate/unknown stdin errors exit2; scope unwinds and diagnostics remain redacted')
+p=subprocess.run([os.fsencode(bins/'helixlane'),b'open',b'alice@host',b'--password',b'private-test-canary',b'\xff'],env=env,capture_output=True,timeout=5)
+assert p.returncode==2 and b'private-test-canary' not in p.stdout+p.stderr
+print('main invalid Unicode after credential arguments exits2 with protected collection and redacted diagnostics')
+
+for name,args,expected in [('helixlane-putty',['-pw','--auth-none','alice@host'],'--auth-none'),('helixlane-putty',['-ssh','-l','alice','-pw','proxy-test-canary','host.invalid'],'proxy-test-canary'),('helixlane-winscp',['sftp://alice:c%3Ap%26%20word@host.invalid/a%20b'],'c:p& word')]:
  with tempfile.TemporaryDirectory(prefix='helixlane-stdin-proxy-') as temp:
   folder=pathlib.Path(temp);shutil.copy2(bins/name,folder/name)
   stub=folder/'helixlane';stub.write_text('#!/usr/bin/python3\nimport json,sys,os\nw=json.load(sys.stdin)\nwith open(os.environ["TEST_RESULT"],"w") as f:json.dump({"argv":sys.argv[1:],"auth_received":w["password"]==os.environ["EXPECTED_TEST_PASSWORD"]},f)\n');stub.chmod(0o700)
