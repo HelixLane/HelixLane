@@ -169,6 +169,7 @@ pub struct FilePane {
     last_refresh: std::time::Instant,
     visibility: Subscription,
     ticket: Option<helixlane::workspace::TargetTicket>,
+    binding_dirty: bool,
     settings: Rc<RefCell<Settings>>,
     profile: ConnectionProfile,
     auth: Entity<TerminalPane>,
@@ -245,6 +246,7 @@ impl FilePane {
             last_refresh: std::time::Instant::now(),
             visibility,
             ticket,
+            binding_dirty: false,
             profile,
             auth,
             settings: settings.clone(),
@@ -427,6 +429,29 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.bind_background(profile.clone(), cx);
+        self.auth.update(cx, |a, cx| a.bind(profile, window, cx));
+        if self.binding_dirty {
+            self.binding_dirty = false;
+            let path = self.state.lock().unwrap().remote.path.clone();
+            self.remote_path
+                .update(cx, |s, cx| s.set_value(path, window, cx));
+        }
+    }
+    fn sync_background_binding(&mut self, cx: &mut Context<Self>) {
+        let target = self
+            .settings
+            .borrow()
+            .workspace
+            .capture_task_target(self.id);
+        if let Some(target) = target {
+            self.bind_background(target.profile, cx);
+        } else if self.ticket.take().is_some() {
+            self.invalidate_binding(false);
+            self.auth.update(cx, |a, cx| a.pause_binding(cx));
+        }
+    }
+    fn bind_background(&mut self, profile: ConnectionProfile, cx: &mut Context<Self>) {
         let ticket = self.settings.borrow().workspace.ticket(self.id);
         if profile == self.profile && ticket == self.ticket {
             return;
@@ -434,7 +459,11 @@ impl FilePane {
         let preserve_path = self.ticket == ticket;
         self.ticket = ticket;
         self.profile = profile.clone();
-        self.auth.update(cx, |a, cx| a.bind(profile, window, cx));
+        self.auth.update(cx, |a, cx| a.bind_background(profile, cx));
+        self.invalidate_binding(preserve_path);
+    }
+    fn invalidate_binding(&mut self, preserve_path: bool) {
+        self.binding_dirty = true;
         let mut s = self.state.lock().unwrap();
         s.generation += 1;
         s.endpoint = None;
@@ -446,15 +475,12 @@ impl FilePane {
         } else {
             ".".into()
         };
-        s.remote = Browser::remote(path.clone());
+        s.remote = Browser::remote(path);
         s.busy = false;
         s.error = None;
         s.delete = false;
         s.form = None;
         s.pending = None;
-        drop(s);
-        self.remote_path
-            .update(cx, |s, cx| s.set_value(path, window, cx));
     }
     pub fn set_visible(&mut self, visible: bool) {
         if visible && !self.visible {
@@ -466,6 +492,7 @@ impl FilePane {
         self.local_path.read(cx).focus_handle(cx)
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
+        self.sync_background_binding(cx);
         let session = self.auth.read(cx).shared_session();
         let should = {
             let settings = self.settings.borrow();
@@ -1902,5 +1929,80 @@ mod launch_path_tests {
         assert_eq!(s.remote.entries[0].name, "B.txt");
         drop(s);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "shell-tests"))]
+mod windowless_binding_tests {
+    use super::FilePane;
+    use gpui_kit as gpui;
+    use helixlane::{
+        settings::Settings,
+        workspace::{RunPolicy, TargetMode, ToolKind},
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    #[gpui::test]
+    fn windowless_sftp_retargets_and_rejects_late_results_after_source_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_quit_mode(gpui::QuitMode::Explicit);
+        });
+        let mut settings = Settings::default();
+        let owned = settings.workspace.create_window(Some(1));
+        let id = settings
+            .workspace
+            .open_in(owned, ToolKind::Sftp, TargetMode::Follow);
+        settings
+            .workspace
+            .views
+            .iter_mut()
+            .find(|v| v.id == id)
+            .unwrap()
+            .run_policy = RunPolicy::Background;
+        let profile = settings.workspace.capture_task_target(id).unwrap().profile;
+        let settings = Rc::new(RefCell::new(settings));
+        let window = cx.add_window(|w, cx| FilePane::new(id, profile, settings.clone(), w, cx));
+        let pane = window.root(cx).unwrap();
+        cx.update(|cx| {
+            window.update(cx, |_, w, _| w.remove_window()).unwrap();
+            let old = pane.update(cx, |p, _| {
+                super::begin_initial_listing(&mut p.state.lock().unwrap())
+            });
+            settings.borrow_mut().workspace.activate_resource(2);
+            pane.update(cx, |p, cx| {
+                p.poll(cx);
+                assert_eq!(
+                    p.ticket.unwrap().resource_id,
+                    2,
+                    "binding must not require a native window"
+                );
+                assert_eq!(
+                    p.profile.host,
+                    settings.borrow().workspace.resources[1].profiles[0].host
+                );
+                assert!(
+                    p.auth.read(cx).shared_session().is_none(),
+                    "no automatic authentication or prior target session"
+                );
+            });
+            settings.borrow_mut().workspace.activate_resource(1);
+            settings.borrow_mut().workspace.close_window(1);
+            pane.update(cx, |p, cx| {
+                p.poll(cx);
+                assert!(p.ticket.is_none());
+                let mut state = p.state.lock().unwrap();
+                super::finish_initial_listing(
+                    &mut state,
+                    old,
+                    Ok((helixlane::sftp::Endpoint::Local, vec![], "/stale-A".into())),
+                );
+                assert!(state.endpoint.is_none());
+                assert_ne!(state.remote.path, "/stale-A");
+                assert!(!state.busy);
+            });
+        });
     }
 }

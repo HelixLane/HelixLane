@@ -205,6 +205,14 @@ impl HelixLane {
         }
         this.subscriptions
             .push(cx.observe_window_bounds(window, |this, _, cx| this.persist_layout(cx)));
+        this.subscriptions.push(
+            cx.observe_window_visibility(window, |this, visibility, _, cx| {
+                if !visibility.is_visible() {
+                    this.application.hide_drop_targets(this.window_id);
+                }
+                cx.notify();
+            }),
+        );
         this.subscriptions
             .push(cx.observe_window_appearance(window, |this, window, cx| {
                 if this.settings.borrow().theme == ThemePreference::System {
@@ -1355,7 +1363,9 @@ impl Render for HelixLane {
                                     window.bounds().origin + bounds.origin,
                                     bounds.size,
                                 );
-                                app.measure_drop_target(destination, location, bounds);
+                                if window.is_visible() {
+                                    app.measure_drop_target(destination, location, bounds);
+                                }
                             },
                             |_, _, _, _| {},
                         )
@@ -1988,7 +1998,9 @@ impl ToolPanel {
                     .text_color(rgb(p.muted))
                     .child(language.text("plugin_running")),
             );
-            if let Some(script) = plugin.view() {
+            if self.settings.borrow().workspace.target(self.id).is_none() {
+                content = content.child(div().p_3().child(language.text("empty")));
+            } else if let Some(script) = plugin.view() {
                 content = content.child(div().flex_1().min_h_0().child(script));
             }
         } else {

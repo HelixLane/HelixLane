@@ -43,8 +43,12 @@ impl CrossWindowDrag {
         &mut self,
         source: Option<WindowId>,
         pointer: Point<Pixels>,
+        source_client: Option<Bounds<Pixels>>,
     ) -> Option<(ViewId, WindowId, Location)> {
         let id = self.view.take()?;
+        if source_client.is_some_and(|bounds| bounds.contains(&pointer)) {
+            return None;
+        }
         self.targets
             .iter()
             .rev()
@@ -133,6 +137,9 @@ impl ApplicationOwner {
     pub fn begin_drag(&self, id: ViewId) {
         self.0.drag.borrow_mut().view = Some(id);
     }
+    pub fn hide_drop_targets(&self, id: WindowId) {
+        self.0.drag.borrow_mut().remove_window(id);
+    }
     pub fn measure_drop_target(&self, id: WindowId, location: Location, bounds: Bounds<Pixels>) {
         self.0.drag.borrow_mut().measure(id, location, bounds);
     }
@@ -152,7 +159,15 @@ impl ApplicationOwner {
         let id = self.0.drag.borrow().view;
         let source = id.and_then(|id| self.settings().borrow().workspace.owner(id));
         let pointer = window.bounds().origin + event.position;
-        let destination = self.0.drag.borrow_mut().finish(source, pointer);
+        let source_client = source
+            .and_then(|id| self.window(id))
+            .filter(|(handle, _)| *handle == window.window_handle())
+            .map(|_| window.bounds());
+        let destination = self
+            .0
+            .drag
+            .borrow_mut()
+            .finish(source, pointer, source_client);
         if let Some((id, destination, location)) = destination {
             cx.stop_active_drag(window);
             cx.stop_propagation();
@@ -372,21 +387,26 @@ mod tests {
         // Source window at x=1100 receives the grabbed pointer at local x=-910.
         let pointer = gpui::point(gpui::px(1100. - 910.), gpui::px(57.));
         assert_eq!(
-            drag.finish(Some(200), pointer),
+            drag.finish(Some(200), pointer, None),
             Some((100, 1, Location::Top))
         );
         assert!(
-            drag.finish(Some(200), pointer).is_none(),
+            drag.finish(Some(200), pointer, None).is_none(),
             "drop consumed once"
         );
         drag.view = Some(100);
         assert!(
-            drag.finish(Some(1), pointer).is_none(),
+            drag.finish(Some(1), pointer, None).is_none(),
             "Kit owns same-window drops"
         );
         drag.view = Some(100);
+        assert!(
+            drag.finish(Some(200), pointer, Some(bounds)).is_none(),
+            "a strip behind the source client must not steal a same-window drop"
+        );
+        drag.view = Some(100);
         drag.remove_window(1);
-        assert!(drag.finish(Some(200), pointer).is_none());
+        assert!(drag.finish(Some(200), pointer, None).is_none());
     }
     #[gpui::test]
     fn registry_keeps_one_entity_when_moving_between_native_window_roots(

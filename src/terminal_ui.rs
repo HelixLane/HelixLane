@@ -28,6 +28,8 @@ pub struct TerminalPane {
     settings: Rc<RefCell<Settings>>,
     profile: ConnectionProfile,
     bound_profile: ConnectionProfile,
+    binding_dirty: bool,
+    binding_paused: bool,
     session: Option<Arc<Session>>,
     sessions: Vec<Arc<Session>>,
     password: Entity<InputState>,
@@ -101,6 +103,8 @@ impl TerminalPane {
             view_id,
             settings,
             bound_profile: profile.clone(),
+            binding_dirty: false,
+            binding_paused: false,
             username: cx.new(|cx| {
                 InputState::new(window, cx)
                     .default_value(profile.username.clone())
@@ -183,6 +187,7 @@ impl TerminalPane {
         self._search_subscription = cx.observe(&self.search, |_, _, cx| cx.notify());
         self.preedit.clear();
         self.composition_target = None;
+        self.sync_binding_inputs(window, cx);
     }
     pub fn transport_only(&mut self) {
         self.transport_only = true;
@@ -201,14 +206,21 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.bound_profile == profile {
+        self.bind_background(profile, cx);
+        self.sync_binding_inputs(window, cx);
+    }
+    /// Select an already established transport without a presentation or authentication.
+    /// Only input synchronization needs a Window; jobs keep their captured sessions.
+    pub fn bind_background(&mut self, profile: ConnectionProfile, cx: &mut Context<Self>) {
+        if self.bound_profile == profile && !self.binding_paused {
             return;
         }
+        self.binding_paused = false;
+        self.binding_dirty = true;
         self.bound_profile = profile.clone();
-        self.username.update(cx, |s, cx| {
-            s.set_value(profile.username.clone(), window, cx)
-        });
         self.launch_secret = None;
+        self.auth_fields.clear();
+        self.shown_prompt = None;
         self.profile = profile;
         self.session = self
             .sessions
@@ -229,16 +241,23 @@ impl TerminalPane {
                     None
                 }
             });
-        self.password
-            .update(cx, |s, cx| s.set_value("", window, cx));
-        let path = match &self.profile.auth {
-            AuthMethod::PrivateKey { path } => path.clone(),
-            _ => String::new(),
-        };
-        self.key_path
-            .update(cx, |s, cx| s.set_value(path, window, cx));
         self.selecting = None;
         self.preedit.clear();
+        self.composition_target = None;
+        self.publish_session();
+        cx.notify();
+    }
+    pub fn pause_binding(&mut self, cx: &mut Context<Self>) {
+        self.binding_paused = true;
+        self.binding_dirty = true;
+        self.launch_secret = None;
+        self.auth_fields.clear();
+        self.shown_prompt = None;
+        self.session = None;
+        self.publish_session();
+        cx.notify();
+    }
+    fn publish_session(&self) {
         if let Some(view) = self
             .settings
             .borrow_mut()
@@ -249,7 +268,23 @@ impl TerminalPane {
         {
             view.session_id = self.session.as_ref().map(|s| s.id);
         }
-        cx.notify();
+    }
+    fn sync_binding_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.binding_dirty {
+            return;
+        }
+        self.binding_dirty = false;
+        self.username.update(cx, |s, cx| {
+            s.set_value(self.profile.username.clone(), window, cx)
+        });
+        self.password
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        let path = match &self.profile.auth {
+            AuthMethod::PrivateKey { path } => path.clone(),
+            _ => String::new(),
+        };
+        self.key_path
+            .update(cx, |s, cx| s.set_value(path, window, cx));
     }
     fn persist_profile(&self, cx: &App) {
         if self.profile.ephemeral {
@@ -318,6 +353,10 @@ impl TerminalPane {
         }
     }
     fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_binding_inputs(window, cx);
+        if self.binding_paused {
+            return;
+        }
         self.profile.username = self.username.read(cx).value().to_string();
         if self.profile.username.trim().is_empty() {
             window.focus(&self.username.read(cx).focus_handle(cx), cx);
@@ -1221,5 +1260,74 @@ fn color(color: Color, foreground: u32, background: u32) -> u32 {
             let component = |v: u8| if v == 0 { 0 } else { 55 + 40 * u32::from(v) };
             (component(n / 36) << 16) | (component((n / 6) % 6) << 8) | component(n % 6)
         }
+    }
+}
+
+#[cfg(all(test, feature = "shell-tests"))]
+mod windowless_auth_tests {
+    use super::TerminalPane;
+    use gpui_kit::{self as gpui, IntoElement, ParentElement};
+    use helixlane::{
+        settings::Settings,
+        ssh::credentials::Secret,
+        workspace::{TargetMode, ToolKind},
+    };
+    use std::{cell::RefCell, rc::Rc};
+    struct Rebound(gpui::Entity<TerminalPane>);
+    impl gpui::Render for Rebound {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            gpui::div().child(self.0.clone())
+        }
+    }
+    #[gpui::test]
+    fn windowless_auth_retarget_clears_launch_secret_and_rebound_password(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_quit_mode(gpui::QuitMode::Explicit);
+        });
+        let mut settings = Settings::default();
+        let id = settings.workspace.open(ToolKind::Sftp, TargetMode::Follow);
+        let first = settings.workspace.capture_task_target(id).unwrap().profile;
+        settings.workspace.activate_resource(2);
+        let second = settings.workspace.capture_task_target(id).unwrap().profile;
+        let settings = Rc::new(RefCell::new(settings));
+        let window = cx.add_window(|w, cx| TerminalPane::new(id, first, settings, w, cx));
+        let pane = window.root(cx).unwrap();
+        cx.update(|cx| {
+            window
+                .update(cx, |p, w, cx| {
+                    p.password
+                        .update(cx, |input, cx| input.set_value("OLD-A-SECRET", w, cx));
+                    p.launch_secret = Some(Secret::new("OLD-LAUNCH-SECRET".into()));
+                    w.remove_window();
+                })
+                .unwrap();
+            pane.update(cx, |p, cx| {
+                p.bind_background(second.clone(), cx);
+                assert!(p.launch_secret.is_none());
+                assert!(p.session.is_none());
+                assert!(p.sessions.is_empty());
+                assert!(p.binding_dirty);
+                assert_eq!(p.profile, second);
+            });
+        });
+        let rebound = cx.add_window(|w, cx| {
+            pane.update(cx, |p, cx| p.rebind_window(w, cx));
+            Rebound(pane.clone())
+        });
+        cx.update(|cx| {
+            pane.update(cx, |p, cx| {
+                assert!(p.password.read(cx).value().is_empty());
+                assert_eq!(p.username.read(cx).value().to_string(), second.username);
+                assert!(!p.binding_dirty);
+            });
+            rebound.update(cx, |_, w, _| w.remove_window()).unwrap();
+        });
     }
 }

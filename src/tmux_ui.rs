@@ -162,10 +162,33 @@ impl TmuxPane {
         }
     }
     pub fn bind(&mut self, p: ConnectionProfile, w: &mut Window, cx: &mut Context<Self>) {
+        self.bind_background(p.clone(), cx);
+        self.auth.update(cx, |a, cx| a.bind(p, w, cx));
+    }
+    fn sync_background_binding(&mut self, cx: &mut Context<Self>) {
+        let target = self
+            .settings
+            .borrow()
+            .workspace
+            .capture_task_target(self.id);
+        if let Some(target) = target {
+            self.bind_background(target.profile, cx);
+        } else if self.ticket.take().is_some() {
+            self.invalidate_binding();
+            self.auth.update(cx, |a, cx| a.pause_binding(cx));
+        }
+    }
+    fn bind_background(&mut self, p: ConnectionProfile, cx: &mut Context<Self>) {
         let ticket = self.settings.borrow().workspace.ticket(self.id);
         if p == self.profile && ticket == self.ticket {
             return;
         }
+        self.invalidate_binding();
+        self.ticket = ticket;
+        self.profile = p.clone();
+        self.auth.update(cx, |a, cx| a.bind_background(p, cx));
+    }
+    fn invalidate_binding(&mut self) {
         if let Some((_, mut task, collection)) = self.pending.take() {
             if collection {
                 task.cancel();
@@ -179,9 +202,6 @@ impl TmuxPane {
                 ));
             }
         }
-        self.ticket = ticket;
-        self.profile = p.clone();
-        self.auth.update(cx, |a, cx| a.bind(p, w, cx));
         self.generation += 1;
         self.sessions.clear();
         self.output.clear();
@@ -192,6 +212,7 @@ impl TmuxPane {
         self.name.read(cx).focus_handle(cx)
     }
     fn poll(&mut self, cx: &mut Context<Self>) {
+        self.sync_background_binding(cx);
         self.background_tasks
             .retain_mut(|(target, task)| match task.result.try_recv() {
                 Ok(result) => {
@@ -455,5 +476,70 @@ impl Render for TmuxPane {
             );
         }
         content.into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "shell-tests"))]
+mod windowless_binding_tests {
+    use super::TmuxPane;
+    use gpui_kit as gpui;
+    use helixlane::{
+        settings::Settings,
+        workspace::{RunPolicy, TargetMode, ToolKind},
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    #[gpui::test]
+    fn windowless_tmux_retargets_and_clears_collection_after_source_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_quit_mode(gpui::QuitMode::Explicit);
+        });
+        let mut settings = Settings::default();
+        let owned = settings.workspace.create_window(Some(1));
+        let id = settings
+            .workspace
+            .open_in(owned, ToolKind::Tmux, TargetMode::Follow);
+        settings
+            .workspace
+            .views
+            .iter_mut()
+            .find(|v| v.id == id)
+            .unwrap()
+            .run_policy = RunPolicy::Background;
+        let profile = settings.workspace.capture_task_target(id).unwrap().profile;
+        let settings = Rc::new(RefCell::new(settings));
+        let window = cx.add_window(|w, cx| TmuxPane::new(id, profile, settings.clone(), w, cx));
+        let pane = window.root(cx).unwrap();
+        cx.update(|cx| {
+            window.update(cx, |_, w, _| w.remove_window()).unwrap();
+            pane.update(cx, |p, _| {
+                p.sessions.push("old-A".into());
+                p.output = "old result".into();
+            });
+            settings.borrow_mut().workspace.activate_resource(2);
+            pane.update(cx, |p, cx| {
+                p.poll(cx);
+                assert_eq!(
+                    p.ticket.unwrap().resource_id,
+                    2,
+                    "binding must not require a native window"
+                );
+                assert!(p.sessions.is_empty());
+                assert!(p.output.is_empty());
+                assert!(p.auth.read(cx).shared_session().is_none());
+            });
+            settings.borrow_mut().workspace.activate_resource(1);
+            settings.borrow_mut().workspace.close_window(1);
+            pane.update(cx, |p, cx| {
+                let before = p.generation;
+                p.poll(cx);
+                assert!(p.ticket.is_none());
+                assert!(p.generation > before);
+                assert!(p.pending.is_none());
+            });
+        });
     }
 }
