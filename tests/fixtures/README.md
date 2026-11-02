@@ -1,0 +1,1 @@
+`rsa_test_key` and its public key are synthetic, deliberately public test-only RSA fixtures. They grant access to no system. Generated using `ssh-keygen -t rsa -b 2048 -N ''` for the local loopback RSA authentication regression test. Never install them as authorized keys or use them for real access.

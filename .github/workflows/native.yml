@@ -1,0 +1,124 @@
+name: Native validation and packages
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+          - os: macos-15
+            platform: macos
+          - os: windows-2025
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ matrix.platform }}-1.99.1
+          cache-on-failure: true
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake pkg-config libasound2-dev libfontconfig1-dev libfreetype6-dev libglib2.0-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxcb-xkb-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxcb-render0-dev libxcb1-dev libxcb-xinput-dev libxcb-xinerama0-dev libdbus-1-dev libudev-dev libssl-dev libvulkan-dev libgit2-dev openssh-server openssh-sftp-server tmux xdg-utils desktop-file-utils
+          test -x /usr/lib/openssh/sftp-server
+          tmux -V
+          echo HELIXLANE_REQUIRE_NATIVE_INTEGRATION=1 >> "$GITHUB_ENV"
+      - name: macOS native test dependency
+        if: runner.os == 'macOS'
+        run: |
+          brew install tmux
+          test -x /usr/libexec/sftp-server
+          echo HELIXLANE_REQUIRE_NATIVE_INTEGRATION=1 >> "$GITHUB_ENV"
+      - name: Windows OpenSSH SFTP backend
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "$env:RUNNER_TEMP\openssh.zip"
+          Invoke-WebRequest https://github.com/PowerShell/Win32-OpenSSH/releases/download/v9.8.3.0p2-Preview/OpenSSH-Win64.zip -OutFile $archive
+          Expand-Archive $archive "$env:RUNNER_TEMP\openssh"
+          $server = "$env:RUNNER_TEMP\openssh\OpenSSH-Win64\sftp-server.exe"
+          if (!(Test-Path $server)) { throw 'Real SFTP server missing' }
+          "HELIXLANE_SFTP_SERVER=$server" >> $env:GITHUB_ENV
+      - name: Exact vendor provenance and source format
+        shell: bash
+        run: |
+          python3 scripts/verify-russh-vendor.py
+          python3 scripts/verify-shell-vendor.py
+          python3 -B scripts/vendor_provenance_test.py -v
+          python3 -B scripts/package_test.py -v
+          cargo fmt --all -- --check
+          git diff --check
+          rustc -Vv
+          cargo -V
+      - name: Strict application lint
+        run: cargo clippy --locked --all-targets --features shell-tests -- -D warnings
+      - name: Full suite including real JavaScript host tests
+        run: cargo test --locked --features shell-tests -- --nocapture
+      - name: Full sshd authentication, SFTP, jump and forwarding
+        if: runner.os == 'Linux'
+        run: |
+          python3 -B scripts/native_fixture_cleanup_test.py -v
+          python3 scripts/native_openssh.py
+      - name: Build actual desktop and compatibility launchers
+        run: cargo build --locked --bins --features shell-tests
+      - name: Native executable stream, exit and Windows subsystem checks
+        run: python3 scripts/portable_smoke.py
+      - name: Unix launch contract smoke
+        if: runner.os != 'Windows'
+        run: python3 scripts/launch_smoke.py
+      - name: Linux desktop registration
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/desktop_entry_smoke.py
+          sh packaging/linux/install.sh "$PWD/target/debug/helixlane"
+          test "$(xdg-mime query default x-scheme-handler/helixlane)" = helixlane.desktop
+          desktop-file-validate "$HOME/.local/share/applications/helixlane.desktop"
+      - name: macOS LaunchServices registration
+        if: runner.os == 'macOS'
+        run: |
+          sh packaging/macos/install.sh "$PWD/target/debug" "$RUNNER_TEMP/HelixLane.app"
+          /usr/libexec/PlistBuddy -c 'Print CFBundleURLTypes:0:CFBundleURLSchemes:0' "$RUNNER_TEMP/HelixLane.app/Contents/Info.plist" | grep -Fx helixlane
+          /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -dump > target/launchservices.txt
+          grep -F "$RUNNER_TEMP/HelixLane.app" target/launchservices.txt
+      - name: Windows per-user URI registration
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & packaging/windows/install.ps1 -Executable "$PWD\target\debug\helixlane.exe"
+          $command = (Get-Item 'HKCU:\Software\Classes\helixlane\shell\open\command').GetValue('')
+          if ($command -ne ('"' + "$PWD\target\debug\helixlane.exe" + '" "%1"')) { throw 'URI command does not preserve one quoted argument' }
+      - name: Locked release build and deterministic package
+        shell: bash
+        run: |
+          cargo build --release --locked --bins
+          python3 scripts/package.py --platform ${{ matrix.platform }}
+          cp target/packages/*.zip target/package-first.zip
+          python3 scripts/package.py --platform ${{ matrix.platform }}
+          python3 -c "from pathlib import Path; assert Path('target/package-first.zip').read_bytes()==next(Path('target/packages').glob('*.zip')).read_bytes()"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: helixlane-${{ matrix.platform }}
+          path: |
+            target/packages/*.zip
+            target/native-logs/*.log
+            target/launchservices.txt

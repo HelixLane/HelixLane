@@ -1,50 +1,187 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod app;
-mod editor;
+mod app_assets;
+mod application;
+mod file_ui;
+mod terminal_ui;
 mod theme;
+mod tmux_ui;
 
-use app::HelixLane;
-use gpui_kit::component::{Theme, ThemeMode, TitleBar};
-use gpui_kit::*;
+use gpui_kit::{App, KeyBinding, actions, application, init};
 
-actions!(helixlane, [Quit]);
+actions!(helixlane, [Quit, NewWindow, CloseWindow]);
 
-fn main() {
-    application().with_assets(assets::Assets).run(|cx| {
-        init(cx);
-        Theme::change(ThemeMode::Dark, None, cx);
-        cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
+pub(crate) fn quit_application(cx: &mut App) {
+    if let Some(owner) = cx.try_global::<application::ApplicationOwner>().cloned() {
+        for id in owner.windows() {
+            if let Some((_, view)) = owner.window(id) {
+                let _ = view.update(cx, |view, cx| view.snapshot_layout(cx));
             }
-        })
-        .detach();
-
-        let mut titlebar = TitleBar::title_bar_options();
-        if let Some(position) = titlebar.traffic_light_position.as_mut() {
-            // Preserve Kit's native-button alignment when increasing the toolbar height.
-            position.y += (px(theme::TOOLBAR_HEIGHT) - gpui_kit::component::TITLE_BAR_HEIGHT) * 0.5;
         }
-
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(1440.0), px(900.0)),
-                cx,
-            ))),
-            window_min_size: Some(size(px(960.), px(640.))),
-            titlebar: Some(TitlebarOptions {
-                title: Some("HelixLane".into()),
-                ..titlebar
-            }),
-            ..TitleBar::window_options()
-        };
-
-        open_window(options, cx, |window, cx| {
-            cx.new(|cx| HelixLane::new(window, cx))
-        })
-        .expect("Failed to open the HelixLane desktop window");
-        cx.activate(true);
+        let _ = owner.save();
+    }
+    cx.quit();
+}
+fn register_actions(cx: &mut App) {
+    cx.on_action(|_: &Quit, cx| cx.defer(quit_application));
+    cx.on_action(|_: &NewWindow, cx| {
+        if let Some(owner) = cx.try_global::<application::ApplicationOwner>().cloned() {
+            let _ = owner.create(None, cx);
+        }
     });
+    cx.on_action(|_: &CloseWindow, cx| {
+        if let Some(owner) = cx.try_global::<application::ApplicationOwner>().cloned() {
+            owner.close_active(cx);
+        }
+    });
+    let quit = KeyBinding::load("secondary-q", Box::new(Quit), None, false, None, cx)
+        .expect("Platform quit binding must parse");
+    let new_window = KeyBinding::load(
+        "secondary-shift-n",
+        Box::new(NewWindow),
+        None,
+        false,
+        None,
+        cx,
+    )
+    .expect("new window key");
+    let close_window = KeyBinding::load(
+        "secondary-shift-w",
+        Box::new(CloseWindow),
+        None,
+        false,
+        None,
+        cx,
+    )
+    .expect("close window key");
+    cx.bind_keys([quit, new_window, close_window]);
+    cx.set_menus(vec![gpui_kit::Menu {
+        name: "HelixLane".into(),
+        disabled: false,
+        items: vec![
+            gpui_kit::MenuItem::action("New window / 新窗口", NewWindow),
+            gpui_kit::MenuItem::action("Close window / 关闭窗口", CloseWindow),
+            gpui_kit::MenuItem::separator(),
+            gpui_kit::MenuItem::action("Quit HelixLane / 退出全部任务", Quit),
+        ],
+    }]);
+}
+
+#[cfg(all(test, feature = "shell-tests"))]
+mod startup_tests {
+    use super::register_actions;
+    use gpui_kit as gpui;
+    use gpui_kit::{Keystroke, TestAppContext};
+    #[gpui::test]
+    fn startup_registers_platform_quit_binding(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            register_actions(cx);
+            let key = Keystroke::parse_with_os("secondary-q", cx.platform_info().os).unwrap();
+            assert_eq!(cx.all_bindings_for_input(&[key]).len(), 1);
+        });
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    helixlane::launch::attach_parent_console();
+    let args = match helixlane::launch::os_arguments() {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("HelixLane: {error}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let entry = match helixlane::launch::parse_native(&args) {
+        Ok(e) => e,
+        Err(error) => {
+            eprintln!("HelixLane: {error}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    drop(args);
+    use helixlane::launch::{Entry, MAX_FRAME};
+    let request = match entry {
+        Entry::Help => {
+            print!("{}", helixlane::launch::HELP);
+            return std::process::ExitCode::SUCCESS;
+        }
+        Entry::Version => {
+            println!("HelixLane {}", env!("CARGO_PKG_VERSION"));
+            return std::process::ExitCode::SUCCESS;
+        }
+        Entry::Open(r) => Some(r),
+        Entry::Gui => Some(helixlane::launch::OpenRequest::focus()),
+        Entry::Stdin => {
+            use std::io::Read;
+            let mut bytes = zeroize::Zeroizing::new(Vec::new());
+            if std::io::stdin()
+                .take((MAX_FRAME + 1) as u64)
+                .read_to_end(&mut bytes)
+                .is_err()
+            {
+                eprintln!("HelixLane: Unable to read launch request / 无法读取启动请求");
+                return std::process::ExitCode::from(2);
+            }
+            match helixlane::launch::decode(&bytes) {
+                Ok(r) => Some(r),
+                Err(error) => {
+                    eprintln!("HelixLane: {error}");
+                    return std::process::ExitCode::from(2);
+                }
+            }
+        }
+    };
+    // Every entry path shares the protected primary-instance channel.
+    if let Some(r) = &request {
+        match helixlane::launch::ipc::forward(r) {
+            Ok(true) => return std::process::ExitCode::SUCCESS,
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("HelixLane: {error}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+    let server = match helixlane::launch::ipc::start() {
+        Ok(server) => server,
+        Err(error) => {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            if let Some(request) = &request {
+                while std::time::Instant::now() < deadline {
+                    match helixlane::launch::ipc::forward(request) {
+                        Ok(true) => return std::process::ExitCode::SUCCESS,
+                        Ok(false) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                        Err(_) => break,
+                    }
+                }
+            }
+            eprintln!("HelixLane: {error}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let urls = server.sender();
+    let application = application().with_assets(app_assets::AppAssets);
+    application.on_open_urls(move |incoming| {
+        for url in incoming
+            .into_iter()
+            .take(helixlane::launch::ipc::QUEUE_CAPACITY)
+        {
+            match helixlane::launch::parse_native(&[url]) {
+                Ok(Entry::Open(r)) => {
+                    if urls.try_send(r).is_err() {
+                        eprintln!("HelixLane: Launch queue full / 启动队列已满");
+                    }
+                }
+                _ => eprintln!("HelixLane: Invalid protocol URL / 协议 URL 无效；参数值已隐藏"),
+            }
+        }
+    });
+    application.run(move |cx| {
+        gpui_shell::init(cx);
+        init(cx);
+        register_actions(cx);
+        let owner = application::ApplicationOwner::install(cx);
+        owner.start(server, request, cx);
+    });
+    std::process::ExitCode::SUCCESS
 }

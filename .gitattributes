@@ -1,0 +1,3 @@
+# Published-source fingerprints require exact bytes on every checkout, including
+# upstream CRLF files. Do not apply Git text/line-ending conversion to vendors.
+vendor/** -text
