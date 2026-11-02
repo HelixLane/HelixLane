@@ -104,6 +104,7 @@ fn main() -> std::process::ExitCode {
         }
     });
     application.run(move |cx| {
+        gpui_shell::init(cx);
         init(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);

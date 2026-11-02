@@ -11,6 +11,10 @@ use gpui_kit::{assets::IconName, prelude::FluentBuilder as _, *};
 use helixlane::{
     i18n::Language,
     settings::{Settings, ThemePreference},
+    tools::{
+        ResourceCapabilities, ToolInstance, ToolProvider,
+        shell::{EXAMPLE_ID, NativePlugin},
+    },
     workspace::*,
 };
 use std::{
@@ -82,6 +86,10 @@ impl HelixLane {
                 tmux: None,
                 transfers: None,
                 launch: None,
+                instance: None,
+                plugin: None,
+                plugin_error: None,
+                plugin_language: None,
             });
             map.borrow_mut().insert(id, p.clone());
             panel_handle(p)
@@ -367,6 +375,10 @@ impl HelixLane {
                 tmux: None,
                 transfers: None,
                 launch: None,
+                instance: None,
+                plugin: None,
+                plugin_error: None,
+                plugin_language: None,
             });
             self.panels.borrow_mut().insert(id, p.clone());
             groups.push((id, DockLayout::tabs().panel_view(panel_handle(p), cx)));
@@ -433,6 +445,10 @@ impl HelixLane {
                 tmux: None,
                 transfers: None,
                 launch: None,
+                instance: None,
+                plugin: None,
+                plugin_error: None,
+                plugin_language: None,
             })
         });
         self.panels.borrow_mut().insert(id, panel.clone());
@@ -728,6 +744,7 @@ impl HelixLane {
             (3, ToolKind::Transfers, IconName::ArrowDown),
             (4, ToolKind::Information, IconName::Info),
             (5, ToolKind::Tmux, IconName::SquareTerminal),
+            (6, ToolKind::Plugin, IconName::Code),
         ] {
             rail = rail.child(
                 Button::new(("tool-rail", index))
@@ -1023,6 +1040,10 @@ struct ToolPanel {
     tmux: Option<Entity<crate::tmux_ui::TmuxPane>>,
     transfers: Option<Entity<crate::file_ui::TransfersPane>>,
     launch: Option<helixlane::launch::OpenRequest>,
+    instance: Option<ToolInstance>,
+    plugin: Option<NativePlugin>,
+    plugin_error: Option<String>,
+    plugin_language: Option<Language>,
 }
 impl EventEmitter<PanelEvent> for ToolPanel {}
 impl Focusable for ToolPanel {
@@ -1070,7 +1091,7 @@ impl BasePanel for ToolPanel {
                     .find(|v| v.id == self.id)
                     .and_then(|v| match (v.tool, v.mode) {
                         (
-                            ToolKind::Terminal | ToolKind::Sftp | ToolKind::Tmux,
+                            ToolKind::Terminal | ToolKind::Sftp | ToolKind::Tmux | ToolKind::Plugin,
                             TargetMode::Fixed(id),
                         ) => Some(id),
                         _ => None,
@@ -1200,6 +1221,98 @@ impl ToolPanel {
             let _ = owner.update(cx, |this, cx| f(this, id, w, cx));
         }))
     }
+    fn plugin_content(
+        &mut self,
+        view: &ViewInstance,
+        language: Language,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.plugin_language != Some(language) {
+            self.plugin.take();
+            self.plugin_error = None;
+            self.plugin_language = Some(language);
+        }
+        if !view.plugin_enabled {
+            self.plugin.take();
+        }
+        if view.plugin_enabled && self.plugin.is_none() && self.plugin_error.is_none() {
+            let instance = ToolProvider::plugin(EXAMPLE_ID, ResourceCapabilities::metadata())
+                .instantiate(self.id, &self.settings.borrow().workspace);
+            match instance
+                .map_err(str::to_owned)
+                .and_then(|instance| NativePlugin::mount(instance, language, window, cx))
+            {
+                Ok(plugin) => self.plugin = Some(plugin),
+                Err(error) => self.plugin_error = Some(error),
+            }
+        }
+        let p = Palette::current(cx);
+        let enabled = view.plugin_enabled;
+        let mut content = div().flex().flex_col().size_full().min_h_0().gap_2();
+        let mut controls = row().px_3().py_2().gap_2().child(
+            button(
+                ("plugin-toggle", self.id),
+                language.text(if enabled {
+                    "plugin_unload"
+                } else {
+                    "plugin_enable"
+                }),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.plugin.take();
+                this.plugin_error = None;
+                if let Some(view) = this
+                    .settings
+                    .borrow_mut()
+                    .workspace
+                    .views
+                    .iter_mut()
+                    .find(|view| view.id == this.id)
+                {
+                    view.plugin_enabled = !enabled;
+                }
+                let _ = this.owner.update(cx, |owner, _| owner.persist());
+                cx.notify();
+            })),
+        );
+        if enabled {
+            controls = controls.child(
+                button(("plugin-reload", self.id), language.text("plugin_retry")).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.plugin.take();
+                        this.plugin_error = None;
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        content = content.child(controls);
+        if let Some(error) = &self.plugin_error {
+            content = content
+                .child(
+                    div()
+                        .px_3()
+                        .text_color(rgb(p.muted))
+                        .child(language.text("plugin_failed")),
+                )
+                .child(div().px_3().child(error.clone()));
+        } else if let Some(plugin) = &self.plugin {
+            content = content.child(
+                div()
+                    .px_3()
+                    .text_size(px(11.))
+                    .text_color(rgb(p.muted))
+                    .child(language.text("plugin_running")),
+            );
+            if let Some(script) = plugin.view() {
+                content = content.child(div().flex_1().min_h_0().child(script));
+            }
+        } else {
+            content = content.child(div().p_3().child(language.text("plugin_disabled")));
+        }
+        content.into_any_element()
+    }
     fn services(&self, p: Palette, language: Language, cx: &mut Context<Self>) -> AnyElement {
         let by_type = self
             .owner
@@ -1298,6 +1411,7 @@ impl ToolPanel {
                                 ToolKind::Transfers => IconName::ArrowDown,
                                 ToolKind::Information => IconName::Info,
                                 ToolKind::Tmux => IconName::SquareTerminal,
+                                ToolKind::Plugin => IconName::Code,
                             })
                             .text_color(rgb(p.muted)),
                         )
@@ -1341,6 +1455,21 @@ impl Render for ToolPanel {
             .target(self.id)
             .and_then(|id| state.workspace.resources.iter().find(|r| r.id == id))
             .cloned();
+        let provider = if v.tool == ToolKind::Plugin {
+            ToolProvider::plugin(EXAMPLE_ID, ResourceCapabilities::metadata())
+        } else {
+            ToolProvider::builtin(v.tool)
+        };
+        if let Ok(next) = provider.instantiate(self.id, &state.workspace) {
+            if self.instance.as_ref().is_none_or(|instance| {
+                instance.context() != next.context()
+                    || instance.native_target() != next.native_target()
+            }) {
+                self.instance = Some(next);
+                self.plugin.take();
+                self.plugin_error = None;
+            }
+        }
         drop(state);
         let tools = v.tool.resource_scoped().then(|| {
             row()
@@ -1401,6 +1530,7 @@ impl Render for ToolPanel {
                 ))
         });
         let content = match v.tool {
+            ToolKind::Plugin => self.plugin_content(&v, language, window, cx),
             ToolKind::Services => self.services(p, language, cx),
             ToolKind::Transfers => {
                 let pane = self
@@ -1429,7 +1559,12 @@ impl Render for ToolPanel {
                 info.into_any_element()
             }
             ToolKind::Terminal => {
-                if let Some(profile) = resource.as_ref().and_then(|r| r.profiles.first()).cloned() {
+                if let Some(profile) = self
+                    .instance
+                    .as_ref()
+                    .and_then(|instance| instance.native_target())
+                    .map(|target| target.profile.clone())
+                {
                     let terminal = self
                         .terminal
                         .get_or_insert_with(|| {
@@ -1454,7 +1589,12 @@ impl Render for ToolPanel {
                 }
             }
             ToolKind::Tmux => {
-                if let Some(profile) = resource.as_ref().and_then(|r| r.profiles.first()).cloned() {
+                if let Some(profile) = self
+                    .instance
+                    .as_ref()
+                    .and_then(|instance| instance.native_target())
+                    .map(|target| target.profile.clone())
+                {
                     let pane = self
                         .tmux
                         .get_or_insert_with(|| {
@@ -1476,7 +1616,12 @@ impl Render for ToolPanel {
                 }
             }
             ToolKind::Sftp => {
-                if let Some(profile) = resource.as_ref().and_then(|r| r.profiles.first()).cloned() {
+                if let Some(profile) = self
+                    .instance
+                    .as_ref()
+                    .and_then(|instance| instance.native_target())
+                    .map(|target| target.profile.clone())
+                {
                     let pane = self
                         .files
                         .get_or_insert_with(|| {

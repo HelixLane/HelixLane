@@ -663,7 +663,7 @@ impl Render for TerminalPane {
                     cx.notify();
                 }),
             )
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                 if let Some(session) = &this.session {
                     let lines = match event.delta {
                         ScrollDelta::Lines(delta) => delta.y as i32,

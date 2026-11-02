@@ -18,6 +18,76 @@ impl Language {
         let zh = self == Self::Chinese;
         match key {
             "tmux" => "tmux",
+            "plugin" => {
+                if zh {
+                    "资源插件"
+                } else {
+                    "Resource plugin"
+                }
+            }
+            "plugin_title" => {
+                if zh {
+                    "资源概览 · JavaScript 面板"
+                } else {
+                    "Resource overview · JavaScript panel"
+                }
+            }
+            "plugin_view" => {
+                if zh {
+                    "视图"
+                } else {
+                    "View"
+                }
+            }
+            "plugin_enable" => {
+                if zh {
+                    "启用示例插件"
+                } else {
+                    "Enable example plugin"
+                }
+            }
+            "plugin_unload" => {
+                if zh {
+                    "卸载"
+                } else {
+                    "Unload"
+                }
+            }
+            "plugin_retry" => {
+                if zh {
+                    "重新加载"
+                } else {
+                    "Reload"
+                }
+            }
+            "plugin_disabled" => {
+                if zh {
+                    "插件已停用。启用后仅可读取当前资源的名称、主机和端口。"
+                } else {
+                    "Plugin disabled. Enabling grants the current resource name, host and port only."
+                }
+            }
+            "plugin_permissions" => {
+                if zh {
+                    "权限：只读资源概要。文件、进程、网络、凭据和设置均不可访问。"
+                } else {
+                    "Permissions: resource summary only. Files, processes, network, credentials and settings are denied."
+                }
+            }
+            "plugin_running" => {
+                if zh {
+                    "已启用 · 原生脚本视图"
+                } else {
+                    "Enabled · native script view"
+                }
+            }
+            "plugin_failed" => {
+                if zh {
+                    "插件出错，请重新加载或卸载。"
+                } else {
+                    "Plugin failed. Reload or unload to recover."
+                }
+            }
             "recovered_layout" => {
                 if zh {
                     "部分布局无法恢复，已保留并重新打开视图。"

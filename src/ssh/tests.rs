@@ -304,3 +304,99 @@ pub(super) fn fixture_key() -> russh::keys::PrivateKey {
     )
     .unwrap()
 }
+
+#[test]
+fn rsa_private_key_load_and_sha2_authentication_survive_shell_dependency_alignment() {
+    use std::sync::Mutex;
+    #[derive(Clone)]
+    struct RsaPeer {
+        expected: russh::keys::PublicKey,
+        verified: Arc<Mutex<Option<russh::keys::Algorithm>>>,
+    }
+    impl server::Server for RsaPeer {
+        type Handler = Self;
+        fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self {
+            self.clone()
+        }
+    }
+    impl server::Handler for RsaPeer {
+        type Error = russh::Error;
+        async fn auth_publickey(
+            &mut self,
+            user: &str,
+            key: server::VerifiedPublicKey<'_>,
+        ) -> Result<server::Auth, Self::Error> {
+            if user == "tester" && key.public_key == &self.expected {
+                *self.verified.lock().unwrap() = Some(key.algorithm.clone());
+                Ok(server::Auth::Accept)
+            } else {
+                Ok(server::Auth::reject())
+            }
+        }
+    }
+    let key_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rsa_test_key");
+    let key = russh::keys::load_secret_key(&key_path, None).expect("load RSA private key");
+    let pkcs8_path = key_path.with_file_name("rsa_test_key_pkcs8");
+    let pkcs8_key = russh::keys::load_secret_key(&pkcs8_path, None).expect("load PKCS#8 RSA key");
+    assert_eq!(
+        pkcs8_key.public_key().key_data(),
+        key.public_key().key_data()
+    );
+    assert!(matches!(
+        key.algorithm(),
+        russh::keys::Algorithm::Rsa { .. }
+    ));
+    let path = std::env::temp_dir().join(format!(
+        "helix-rsa-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let service = Service::new(path.clone());
+    service.runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let verified = Arc::new(Mutex::new(None));
+        let peer = RsaPeer {
+            expected: key.public_key().clone(),
+            verified: verified.clone(),
+        };
+        let config = Arc::new(server::Config {
+            keys: vec![key],
+            auth_rejection_time: Duration::ZERO,
+            ..Default::default()
+        });
+        let server =
+            tokio::spawn(
+                async move { peer.clone().run_on_socket(config, &listener).await.unwrap() },
+            );
+        let mut target = profile(port);
+        target.auth = AuthMethod::PrivateKey {
+            path: key_path.to_string_lossy().into_owned(),
+        };
+        let session = service.connect_transport(target, Secret::new(String::new()), false);
+        wait(&session, |state| {
+            matches!(state.status, Status::HostKey { .. })
+        })
+        .await;
+        session.trust(true);
+        wait(&session, |state| {
+            matches!(state.status, Status::Connected | Status::Failed(_))
+        })
+        .await;
+        assert_eq!(session.state.lock().unwrap().status, Status::Connected);
+        assert!(matches!(
+            *verified.lock().unwrap(),
+            Some(russh::keys::Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256 | HashAlg::Sha512)
+            })
+        ));
+        session.disconnect();
+        wait(&session, |state| state.status == Status::Disconnected).await;
+        server.abort();
+    });
+    let _ = std::fs::remove_file(path);
+}

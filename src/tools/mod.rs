@@ -1,6 +1,6 @@
 //! Shared tool ownership boundary. Native adapters keep their existing session services;
 //! scripts only receive a deliberately small, captured resource description.
-use crate::workspace::{ResourceId, ToolKind, ViewId, Workspace};
+use crate::workspace::{ResourceId, TaskTarget, ToolKind, ViewId, Workspace};
 use serde::Serialize;
 use std::{cell::Cell, rc::Rc};
 
@@ -81,6 +81,7 @@ impl ToolProvider {
                 })
             });
         Ok(ToolInstance {
+            native_target: self.kind.and_then(|_| workspace.capture_task_target(id)),
             context: ToolContext {
                 view_id: id,
                 generation: view.generation,
@@ -100,12 +101,18 @@ impl ToolLease {
     }
 }
 pub struct ToolInstance {
+    // Only trusted builtin providers receive connection profiles. Never serialize
+    // ToolInstance or expose this field from a script HostModule.
+    native_target: Option<TaskTarget>,
     context: ToolContext,
     capabilities: ResourceCapabilities,
     lease: ToolLease,
     cleanup: Vec<Box<dyn FnOnce()>>,
 }
 impl ToolInstance {
+    pub fn native_target(&self) -> Option<&TaskTarget> {
+        self.native_target.as_ref()
+    }
     pub fn context(&self) -> &ToolContext {
         &self.context
     }
@@ -139,3 +146,6 @@ impl Drop for ToolInstance {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "desktop")]
+pub mod shell;

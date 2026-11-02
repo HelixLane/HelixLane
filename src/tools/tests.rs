@@ -61,3 +61,28 @@ fn unload_revokes_old_handles_and_drops_subscriptions_and_tasks_once() {
     drop(instance);
     assert_eq!(count.get(), 2);
 }
+
+#[test]
+fn native_profiles_stay_inside_builtin_boundary_and_cli_metadata_stays_private() {
+    let mut workspace = Workspace::default();
+    let id = workspace.open(ToolKind::Sftp, TargetMode::Follow);
+    workspace.resources[0].profiles[0].ephemeral = true;
+    workspace.resources[0].profiles[0].credential_ref = Some("native-only".into());
+    let builtin = ToolProvider::builtin(ToolKind::Sftp)
+        .instantiate(id, &workspace)
+        .unwrap();
+    let plugin = ToolProvider::plugin("example", ResourceCapabilities::metadata())
+        .instantiate(id, &workspace)
+        .unwrap();
+    assert_eq!(
+        builtin
+            .native_target()
+            .unwrap()
+            .profile
+            .credential_ref
+            .as_deref(),
+        Some("native-only")
+    );
+    assert!(plugin.native_target().is_none());
+    assert!(plugin.resource_context().unwrap().resource.is_none());
+}

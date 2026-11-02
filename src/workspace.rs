@@ -188,21 +188,23 @@ pub enum ToolKind {
     Services,
     Information,
     Tmux,
+    Plugin,
 }
 impl ToolKind {
     pub fn resource_scoped(self) -> bool {
         matches!(
             self,
-            Self::Terminal | Self::Sftp | Self::Information | Self::Tmux
+            Self::Terminal | Self::Sftp | Self::Information | Self::Tmux | Self::Plugin
         )
     }
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Terminal,
         Self::Sftp,
         Self::Transfers,
         Self::Services,
         Self::Information,
         Self::Tmux,
+        Self::Plugin,
     ];
     pub fn key(self) -> &'static str {
         match self {
@@ -212,6 +214,7 @@ impl ToolKind {
             Self::Services => "services",
             Self::Information => "information",
             Self::Tmux => "tmux",
+            Self::Plugin => "plugin",
         }
     }
 }
@@ -240,6 +243,8 @@ pub struct ViewInstance {
     pub ephemeral: bool,
     pub id: ViewId,
     pub tool: ToolKind,
+    #[serde(default)]
+    pub plugin_enabled: bool,
     pub mode: TargetMode,
     pub run_policy: RunPolicy,
     pub location: Location,
@@ -389,6 +394,7 @@ impl Workspace {
             ephemeral: false,
             id,
             tool,
+            plugin_enabled: false,
             mode,
             run_policy: RunPolicy::WhileVisible,
             location: Location::Center,
