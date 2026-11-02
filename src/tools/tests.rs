@@ -85,4 +85,57 @@ fn native_profiles_stay_inside_builtin_boundary_and_cli_metadata_stays_private()
     );
     assert!(plugin.native_target().is_none());
     assert!(plugin.resource_context().unwrap().resource.is_none());
+    workspace.views[0].ephemeral = true;
+    let transient_builtin = ToolProvider::builtin(ToolKind::Sftp)
+        .instantiate(id, &workspace)
+        .unwrap();
+    assert!(transient_builtin.native_target().unwrap().profile.ephemeral);
+    assert_eq!(
+        transient_builtin
+            .native_target()
+            .unwrap()
+            .profile
+            .credential_ref
+            .as_deref(),
+        Some("native-only")
+    );
+}
+
+#[test]
+fn enabled_plugin_and_dock_placement_restore_through_sqlite() {
+    use crate::{settings::Settings, workspace::Location};
+    let mut settings = Settings::default();
+    let id = settings
+        .workspace
+        .open(ToolKind::Plugin, TargetMode::Fixed(2));
+    settings.workspace.move_view(id, Location::Right);
+    settings.workspace.views[0].plugin_enabled = true;
+    let path = std::env::temp_dir().join(format!(
+        "helix-plugin-restore-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    settings.save(&path).unwrap();
+    let restored = Settings::load(&path).unwrap();
+    assert_eq!(restored.workspace.views[0].id, id);
+    assert_eq!(restored.workspace.views[0].location, Location::Right);
+    assert!(restored.workspace.views[0].plugin_enabled);
+    assert_eq!(restored.workspace.target(id), Some(2));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn ephemeral_view_identity_is_refused_before_plugin_instantiation() {
+    let mut workspace = Workspace::default();
+    let id = workspace.open(ToolKind::Plugin, TargetMode::Follow);
+    workspace.views[0].ephemeral = true;
+    assert!(
+        ToolProvider::plugin("example", ResourceCapabilities::metadata())
+            .instantiate(id, &workspace)
+            .is_err(),
+        "CLI-only view identities must never enter a JavaScript host context"
+    );
 }

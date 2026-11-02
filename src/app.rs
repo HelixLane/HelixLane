@@ -1460,15 +1460,15 @@ impl Render for ToolPanel {
         } else {
             ToolProvider::builtin(v.tool)
         };
-        if let Ok(next) = provider.instantiate(self.id, &state.workspace) {
-            if self.instance.as_ref().is_none_or(|instance| {
+        if let Ok(next) = provider.instantiate(self.id, &state.workspace)
+            && self.instance.as_ref().is_none_or(|instance| {
                 instance.context() != next.context()
                     || instance.native_target() != next.native_target()
-            }) {
-                self.instance = Some(next);
-                self.plugin.take();
-                self.plugin_error = None;
-            }
+            })
+        {
+            self.instance = Some(next);
+            self.plugin.take();
+            self.plugin_error = None;
         }
         drop(state);
         let tools = v.tool.resource_scoped().then(|| {

@@ -326,7 +326,7 @@ fn rsa_private_key_load_and_sha2_authentication_survive_shell_dependency_alignme
             user: &str,
             key: server::VerifiedPublicKey<'_>,
         ) -> Result<server::Auth, Self::Error> {
-            if user == "tester" && key.public_key == &self.expected {
+            if user == "tester" && key.public_key.key_data() == self.expected.key_data() {
                 *self.verified.lock().unwrap() = Some(key.algorithm.clone());
                 Ok(server::Auth::Accept)
             } else {

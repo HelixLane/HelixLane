@@ -3888,8 +3888,6 @@ checksum = "e0f9dae92b9bc15baa6e530c90bdd4c689d3710bd4d18c3566deb1d6ae182daf"
 [[package]]
 name = "gpui-shell"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbb71947ae5542113bb614d2ff50d7d17f75bb16ce26b21ec3980d5a3bff6934"
 dependencies = [
  "anyhow",
  "async-channel",

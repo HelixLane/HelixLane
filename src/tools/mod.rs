@@ -60,6 +60,9 @@ impl ToolProvider {
         if self.kind.is_some_and(|kind| kind != view.tool) {
             return Err("Provider does not own this tool");
         }
+        if self.kind.is_none() && view.ephemeral {
+            return Err("Transient launch views are unavailable to plugins");
+        }
         let resource = workspace
             .target(id)
             .and_then(|id| {

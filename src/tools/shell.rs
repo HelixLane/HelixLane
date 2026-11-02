@@ -45,8 +45,12 @@ impl Bundle {
     fn new(source: &str) -> std::io::Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
-            "helixlane-plugin-{}-{}",
+            "helixlane-plugin-{}-{}-{}",
             std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let mut builder = std::fs::DirBuilder::new();
@@ -149,6 +153,10 @@ impl NativePlugin {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<Self, String> {
+        // The upstream default environment includes proxy URLs with passwords.
+        // Opt out per policy, including when an embedding caller supplied grants.
+        let capabilities = policy.capabilities().clone().without_default_env();
+        let policy = policy.with_capabilities(capabilities);
         let bundle = Bundle::new(source).map_err(|error| error.to_string())?;
         let runtime = ShellRuntime::new_isolated().map_err(|error| error.to_string())?;
         runtime.set_editor_files(false);
@@ -282,6 +290,7 @@ mod native_tests {
 import { View, div } from "gpui-kit";
 import { context } from "helixlane:resource";
 import * as fs from "fs/promises";
+import process from "process";
 export default class Probe extends View {
   init(_props, cx) {
     this.outcome = "pending";
@@ -290,7 +299,11 @@ export default class Probe extends View {
       try { this.outcome = "resource:" + context().resource.id; }
       catch (error) { this.outcome = "denied:" + error.message; }
       try { await fs.readFile("/etc/passwd"); this.outcome += "|UNSAFE"; }
-      catch (_) { this.outcome += "|fs-denied"; }
+      catch (error) { this.outcome += error.message.includes("capabilit") ? "|fs-denied" : "|unexpected-fs-error:" + error.message; }
+      try { await process.run("helixlane-test-forbidden-command"); this.outcome += "|UNSAFE"; }
+      catch (error) { this.outcome += error.message.includes("capabilit") ? "|process-denied" : "|unexpected-process-error:" + error.message; }
+      try { await fetch("http://127.0.0.1:9/"); this.outcome += "|UNSAFE"; }
+      catch (error) { this.outcome += error.message.includes("capabilit") ? "|network-denied" : "|unexpected-network-error:" + error.message; }
       cx.notify();
     });
   }
@@ -328,12 +341,12 @@ export default class Probe extends View {
         let allowed_tree = draw(&mut context, &a);
         let denied_tree = draw(&mut context, &b);
         assert!(
-            allowed_tree.contains("resource:1|fs-denied|current:1"),
+            allowed_tree.contains("resource:1|fs-denied|process-denied|network-denied|current:1"),
             "{allowed_tree}"
         );
         assert!(
             denied_tree
-                .contains("denied:Resource metadata permission denied|fs-denied|current:denied"),
+                .contains("Resource metadata permission denied|fs-denied|process-denied|network-denied|current:denied"),
             "{denied_tree}"
         );
         assert!(!allowed_tree.contains("UNSAFE"));
@@ -408,7 +421,9 @@ export default class Probe extends View {
         let view = plugin.view().unwrap();
         draw(&mut context, &view);
         context.run_until_parked();
-        context.advance_clock(std::time::Duration::from_millis(11));
+        context
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(11));
         context.run_until_parked();
         assert!(count.get() > 0, "timer actually ran before unload");
         plugin.unload();
@@ -423,7 +438,9 @@ export default class Probe extends View {
         }
         context.run_until_parked();
         let after = count.get();
-        context.advance_clock(std::time::Duration::from_secs(1));
+        context
+            .executor()
+            .advance_clock(std::time::Duration::from_secs(1));
         context.run_until_parked();
         assert_eq!(
             count.get(),
@@ -435,5 +452,127 @@ export default class Probe extends View {
             1,
             "host module closures are released"
         );
+    }
+    #[gpui::test]
+    fn failed_script_mount_restores_authority_and_a_fresh_instance_can_load(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_shell::init);
+        let window = cx.add_window(|_, _| Empty);
+        let mut context = VisualTestContext::from_window(*window.deref(), cx);
+        let previous = policy::default();
+        let instance = instance(true);
+        let lease = instance.lease();
+        let failed = context.update(|window, cx| NativePlugin::mount_source(instance, Language::English,
+            r#"import { View } from "gpui-kit"; export default class Failure extends View { init() { throw new Error("fixture mount failed"); } }"#, window, cx));
+        let error = match failed {
+            Ok(_) => panic!("broken script must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("fixture mount failed"), "{error}");
+        assert!(!lease.is_active());
+        assert_eq!(policy::default().application(), previous.application());
+        let fresh = context
+            .update(|window, cx| {
+                NativePlugin::mount(self::instance(true), Language::Chinese, window, cx)
+            })
+            .unwrap();
+        let view = fresh.view().unwrap();
+        assert!(draw(&mut context, &view).contains("资源概览"));
+        drop(view);
+        drop(fresh);
+        context.run_until_parked();
+    }
+    #[gpui::test]
+    fn plugin_environment_excludes_proxy_credentials_after_async_reentry(cx: &mut TestAppContext) {
+        const CHILD: &str = "HELIXLANE_ENV_PROBE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tools::shell::native_tests::plugin_environment_excludes_proxy_credentials_after_async_reentry", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("HTTP_PROXY", "http://test-user:synthetic-secret@127.0.0.1:9")
+                .env("HTTPS_PROXY", "http://test-user:synthetic-secret@127.0.0.1:9")
+                .env("ALL_PROXY", "http://test-user:synthetic-secret@127.0.0.1:9")
+                .env("http_proxy", "http://test-user:synthetic-secret@127.0.0.1:9")
+                .env("HELIXLANE_PRIVATE_TEST_TOKEN", "synthetic-private-token")
+                .env("HELIXLANE_PUBLIC_TEST_LABEL", "public-label")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "environment isolation subprocess failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert!(
+            std::env::var("HTTP_PROXY")
+                .unwrap()
+                .contains("synthetic-secret")
+        );
+        cx.update(gpui_shell::init);
+        let window = cx.add_window(|_, _| Empty);
+        let mut context = VisualTestContext::from_window(*window.deref(), cx);
+        let source = r#"
+import { View, div } from "gpui-kit";
+import process from "process";
+export default class Probe extends View {
+  init(_props, cx) {
+    this.count = "pending";
+    cx.spawn(async (cx) => {
+      await cx.sleep(1);
+      this.count = `${Object.keys(process.env).length}|${process.env.HTTP_PROXY === undefined}|${process.env.HELIXLANE_PRIVATE_TEST_TOKEN === undefined}|${process.env.HELIXLANE_PUBLIC_TEST_LABEL || "none"}`;
+      cx.notify();
+    });
+  }
+  render() { return div().child("environment:" + this.count); }
+}
+"#;
+        let plugin = context
+            .update(|window, cx| {
+                NativePlugin::mount_source(instance(true), Language::English, source, window, cx)
+            })
+            .unwrap();
+        let view = plugin.view().unwrap();
+        draw(&mut context, &view);
+        context.run_until_parked();
+        context
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(2));
+        context.run_until_parked();
+        let tree = draw(&mut context, &view);
+        assert!(
+            tree.contains("environment:0|true|true|none"),
+            "environment key counts and absence flags: {tree}"
+        );
+        let granted = Policy::new()
+            .with_application("public-label-only")
+            .with_capabilities(
+                gpui_shell::Capabilities::new()
+                    .env_variables(["HELIXLANE_PUBLIC_TEST_LABEL".to_string()]),
+            );
+        let second = context
+            .update(|window, cx| {
+                NativePlugin::mount_with_policy(instance(true), granted, source, window, cx)
+            })
+            .unwrap();
+        let second_view = second.view().unwrap();
+        draw(&mut context, &second_view);
+        context.run_until_parked();
+        context
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(2));
+        context.run_until_parked();
+        let granted_tree = draw(&mut context, &second_view);
+        assert!(
+            granted_tree.contains("environment:1|true|true|public-label"),
+            "{granted_tree}"
+        );
+        assert!(draw(&mut context, &view).contains("environment:0|true|true|none"));
+        drop(second_view);
+        drop(second);
+        drop(view);
+        drop(plugin);
+        context.run_until_parked();
     }
 }

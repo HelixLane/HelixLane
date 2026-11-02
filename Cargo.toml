@@ -41,3 +41,5 @@ windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Security_
 # gpui-shell stdlib requires RSA rc.19; upstream russh 0.65 pins rc.18.
 [patch.crates-io]
 russh = { path = "vendor/russh" }
+# Per-policy opt-out of implicit process.env defaults (including proxy credentials).
+gpui-shell = { path = "vendor/gpui-shell" }
