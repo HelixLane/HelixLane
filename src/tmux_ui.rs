@@ -557,8 +557,10 @@ mod windowless_binding_tests {
 
 #[cfg(all(test, feature = "shell-tests"))]
 mod visibility_tests {
-    use super::*;
+    use super::TmuxPane;
     use gpui_kit as gpui;
+    use helixlane::settings::Settings;
+    use std::{cell::RefCell, rc::Rc, time::Duration};
     #[gpui::test]
     fn native_show_requests_one_immediate_refresh(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {

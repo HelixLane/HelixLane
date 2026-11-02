@@ -500,7 +500,10 @@ impl FilePane {
         } else {
             ".".into()
         };
+        let (hidden, sort) = (s.remote.hidden, s.remote.sort);
         s.remote = Browser::remote(path);
+        s.remote.hidden = hidden;
+        s.remote.sort = sort;
         s.busy = false;
         s.error = None;
         s.delete = false;
@@ -2208,8 +2211,10 @@ mod scoped_file_jobs_tests {
 
 #[cfg(all(test, feature = "shell-tests"))]
 mod visibility_tests {
-    use super::*;
+    use super::FilePane;
     use gpui_kit as gpui;
+    use helixlane::settings::Settings;
+    use std::{cell::RefCell, rc::Rc, time::Duration};
     #[gpui::test]
     fn native_show_requests_one_immediate_refresh(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {

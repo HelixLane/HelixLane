@@ -34,6 +34,7 @@ pub struct HelixLane {
     dock: Entity<DockArea>,
     top: Entity<DockArea>,
     editing: Option<ResourceId>,
+    creating: bool,
     fields: Vec<Entity<InputState>>,
     editor_error: Option<String>,
     error: Option<String>,
@@ -84,6 +85,7 @@ impl HelixLane {
             dock,
             top,
             editing: None,
+            creating: false,
             fields: vec![],
             editor_error: None,
             error: None,
@@ -492,7 +494,7 @@ impl HelixLane {
         }
         found
     }
-    fn snapshot_layout(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn snapshot_layout(&mut self, cx: &mut Context<Self>) {
         let pages = self
             .panels
             .borrow()
@@ -732,7 +734,28 @@ impl HelixLane {
         self.persist_layout(cx);
         cx.notify();
     }
+    fn create_resource(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_resources = true;
+        self.fields = ["", "", "", "22", "", "", ""]
+            .into_iter()
+            .map(|value| cx.new(|cx| InputState::new(window, cx).default_value(value)))
+            .collect();
+        self.editing = None;
+        self.creating = true;
+        self.editor_error = None;
+        self.deleting = false;
+        self.fields[0].update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+    fn cancel_resource(&mut self, cx: &mut Context<Self>) {
+        self.creating = false;
+        self.editing = None;
+        self.fields.clear();
+        self.editor_error = None;
+        cx.notify();
+    }
     fn edit(&mut self, id: ResourceId, window: &mut Window, cx: &mut Context<Self>) {
+        self.creating = false;
         let resource = self
             .settings
             .borrow()
@@ -775,6 +798,15 @@ impl HelixLane {
                 return;
             }
         };
+        if self.creating {
+            let id = self.settings.borrow_mut().workspace.add_resource();
+            self.settings
+                .borrow_mut()
+                .workspace
+                .activate_resource_in(self.window_id, id);
+            self.editing = Some(id);
+            self.creating = false;
+        }
         if let Some(r) = self
             .settings
             .borrow_mut()
@@ -934,8 +966,7 @@ impl HelixLane {
                     },
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
-                    let id = this.settings.borrow_mut().workspace.add_resource();
-                    this.edit(id, window, cx);
+                    this.create_resource(window, cx);
                 })),
             );
         let mut previous_group = None;
@@ -1054,7 +1085,11 @@ impl HelixLane {
     }
     fn editor(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::current(cx);
-        let mut form = island(p).p_4().gap_3().child(self.text("edit"));
+        let mut form =
+            island(p)
+                .p_4()
+                .gap_3()
+                .child(self.text(if self.creating { "new" } else { "edit" }));
         for (index, key) in ["name", "host", "user", "port", "group", "tags", "notes"]
             .into_iter()
             .enumerate()
@@ -1076,36 +1111,37 @@ impl HelixLane {
                 )
                 .child(button("cancel", self.text("cancel")).on_click(cx.listener(
                     |this, _, _, cx| {
-                        this.editing = None;
-                        cx.notify();
+                        this.cancel_resource(cx);
                     },
                 ))),
         )
-        .child(
-            button(
-                "delete",
-                self.text(if self.deleting {
-                    "confirm_delete"
-                } else {
-                    "delete"
-                }),
+        .when(!self.creating, |form| {
+            form.child(
+                button(
+                    "delete",
+                    self.text(if self.deleting {
+                        "confirm_delete"
+                    } else {
+                        "delete"
+                    }),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if !this.deleting {
+                        this.deleting = true;
+                        cx.notify();
+                        return;
+                    }
+                    let id = this.editing.take();
+                    this.settings
+                        .borrow_mut()
+                        .workspace
+                        .resources
+                        .retain(|r| Some(r.id) != id);
+                    this.persist();
+                    cx.refresh_windows();
+                })),
             )
-            .on_click(cx.listener(|this, _, _, cx| {
-                if !this.deleting {
-                    this.deleting = true;
-                    cx.notify();
-                    return;
-                }
-                let id = this.editing.take();
-                this.settings
-                    .borrow_mut()
-                    .workspace
-                    .resources
-                    .retain(|r| Some(r.id) != id);
-                this.persist();
-                cx.refresh_windows();
-            })),
-        )
+        })
         .into_any_element()
     }
 }
@@ -1287,9 +1323,9 @@ impl Render for HelixLane {
                             } else {
                                 "Quit HelixLane (end all tasks)"
                             })
-                            .on_click(|_, _, cx| cx.dispatch_action(&crate::Quit)),
+                            .on_click(|_, _, cx| cx.defer(crate::quit_application)),
                         );
-                        if std::env::var_os("HELIXLANE_QA_FIXTURES").is_none() {
+                        if std::env::var("HELIXLANE_QA_FIXTURES").as_deref() != Ok("1") {
                             return menu;
                         }
                         let owner = owner.clone();
@@ -1316,44 +1352,61 @@ impl Render for HelixLane {
             .views
             .iter()
             .any(|v| v.window_id == self.window_id && v.location != Location::Services);
+        let first_resource = self.settings.borrow().workspace.resources.is_empty();
         let center = if !has_views {
             div()
                 .size_full()
                 .p_5()
                 .flex()
                 .flex_col()
+                .items_start()
                 .gap_3()
                 .child(
                     div()
                         .text_size(px(18.))
                         .child(if language == Language::Chinese {
-                            "连接您的第一台服务器"
+                            if first_resource {
+                                "连接您的第一台服务器"
+                            } else {
+                                "打开连接视图"
+                            }
                         } else {
-                            "Connect your first server"
+                            if first_resource {
+                                "Connect your first server"
+                            } else {
+                                "Open a connection view"
+                            }
                         }),
                 )
                 .child(
                     div()
                         .text_color(rgb(p.muted))
                         .child(if language == Language::Chinese {
-                            "创建 SSH / SFTP 资源，然后打开终端或文件视图。"
+                            if first_resource {
+                                "创建 SSH / SFTP 资源，然后打开终端或文件视图。"
+                            } else {
+                                "选择左侧资源，然后从工具栏打开 SSH 终端或 SFTP 文件。"
+                            }
                         } else {
-                            "Create an SSH / SFTP resource, then open a terminal or file view."
+                            if first_resource {
+                                "Create an SSH / SFTP resource, then open a terminal or file view."
+                            } else {
+                                "Select a resource, then open SSH or SFTP from the tool strip."
+                            }
                         }),
                 )
                 .child(
-                    button(
-                        "empty-create-resource",
-                        if language == Language::Chinese {
+                    Button::new("empty-create-resource")
+                        .primary()
+                        .flex_none()
+                        .label(if language == Language::Chinese {
                             "创建资源"
                         } else {
                             "Create resource"
-                        },
-                    )
-                    .on_click(cx.listener(|this, _, w, cx| {
-                        let id = this.settings.borrow_mut().workspace.add_resource();
-                        this.edit(id, w, cx);
-                    })),
+                        })
+                        .on_click(cx.listener(|this, _, w, cx| {
+                            this.create_resource(w, cx);
+                        })),
                 )
                 .into_any_element()
         } else if has_top {
@@ -1622,16 +1675,13 @@ impl Render for HelixLane {
                     .px_1()
                     .child(self.rail(cx))
                     .when(self.show_resources, |r| {
-                        r.child(
-                            div()
-                                .w(px(230.))
-                                .flex_none()
-                                .child(if self.editing.is_some() {
-                                    self.editor(cx)
-                                } else {
-                                    self.resources(cx)
-                                }),
-                        )
+                        r.child(div().w(px(230.)).flex_none().child(
+                            if self.editing.is_some() || self.creating {
+                                self.editor(cx)
+                            } else {
+                                self.resources(cx)
+                            },
+                        ))
                     })
                     .child(div().flex_1().min_w_0().child(center)),
             )
@@ -2480,6 +2530,62 @@ mod window_regression_tests {
         workspace::{TargetMode, ToolKind},
     };
 
+    #[gpui::test]
+    fn resource_creation_is_draft_until_valid_save_and_cancel_preserves_existing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_shell::init(cx);
+            gpui_kit::init(cx);
+            let owner = ApplicationOwner::install_settings(Settings::default(), cx);
+            owner.open(1, cx).unwrap();
+            let (handle, view) = owner.window(1).unwrap();
+            handle
+                .update(cx, |_, w, cx| {
+                    view.update(cx, |v, cx| {
+                        let next = v.settings.borrow().workspace.next_id;
+                        v.create_resource(w, cx);
+                        assert!(
+                            v.settings
+                                .borrow()
+                                .persistent_snapshot()
+                                .workspace
+                                .resources
+                                .is_empty()
+                        );
+                        assert_eq!(v.settings.borrow().workspace.next_id, next);
+                        v.save_resource(cx); // Empty required fields stay draft, with no resource.
+                        assert!(v.creating);
+                        assert!(v.editor_error.is_some());
+                        v.cancel_resource(cx);
+                        assert!(!v.creating);
+                        assert!(v.settings.borrow().workspace.resources.is_empty());
+                        v.create_resource(w, cx);
+                        for (field, value) in v.fields.iter().zip([
+                            "Production",
+                            "host.example",
+                            "alice",
+                            "22",
+                            "",
+                            "",
+                            "",
+                        ]) {
+                            field.update(cx, |input, cx| input.set_value(value, w, cx));
+                        }
+                        v.save_resource(cx);
+                        let saved = v.settings.borrow().workspace.resources[0].clone();
+                        assert_eq!(saved.profiles[0].host, "host.example");
+                        assert!(!v.creating);
+                        v.edit(saved.id, w, cx);
+                        v.fields[0].update(cx, |input, cx| input.set_value("unsaved", w, cx));
+                        v.cancel_resource(cx);
+                        assert_eq!(v.settings.borrow().workspace.resources, vec![saved]);
+                    })
+                })
+                .unwrap()
+                .unwrap();
+        });
+    }
     #[gpui::test]
     fn services_focus_remounts_background_entity_after_its_native_window_closes(
         cx: &mut gpui::TestAppContext,

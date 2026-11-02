@@ -1,6 +1,6 @@
 # Russh
 
-[![Crate](https://img.shields.io/crates/v/russh.svg)](https://crates.io/crates/russh) 
+[![Crate](https://img.shields.io/crates/v/russh.svg)](https://crates.io/crates/russh)
 [![Docs](https://docs.rs/russh/badge.svg)](https://docs.rs/russh)
 
 A low-level, `async` SSH 2.0 client and server library for Rust / Tokio.
@@ -129,7 +129,7 @@ Russh aims for broad interoperability, so it supports both algorithms currently 
 
 ## Safety
 
-Russh is built to withstand malicious/misbehaving peers. 
+Russh is built to withstand malicious/misbehaving peers.
 
 - `deny(clippy::unwrap_used)`
 - `deny(clippy::expect_used)`
@@ -186,7 +186,7 @@ Exceptions are reviewed and justified manually.
 
 ## History
 
-Russh began as a fork of [Thrussh](https://nest.pijul.com/pijul/thrussh) by Pierre-Étienne Meunier, originally extended to provide the SSH backend for [Warpgate](https://github.com/warp-tech/warpgate). 
+Russh began as a fork of [Thrussh](https://nest.pijul.com/pijul/thrussh) by Pierre-Étienne Meunier, originally extended to provide the SSH backend for [Warpgate](https://github.com/warp-tech/warpgate).
 
 It has since been substantially reworked, and is maintained independently. Russh prioritises safety-by-default and broad algorithm interoperability.
 Thanks to Pierre-Étienne and the Thrussh contributors for the original foundation.

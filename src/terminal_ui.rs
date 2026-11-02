@@ -8,6 +8,7 @@ use gpui_kit::{
         Sizable,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
+        menu::DropdownMenu,
     },
     prelude::FluentBuilder as _,
     *,
@@ -48,6 +49,7 @@ pub struct TerminalPane {
     focus: FocusHandle,
     bounds: Rc<RefCell<Bounds<Pixels>>>,
     selecting: Option<(usize, usize)>,
+    resolved_font: Option<(helixlane::settings::TerminalFont, String)>,
     cell_width: f32,
     cell_height: f32,
     search_found: Option<bool>,
@@ -57,7 +59,7 @@ pub struct TerminalPane {
     composition_target: Option<u64>,
 }
 fn action(id: &'static str, label: impl Into<SharedString>) -> Button {
-    Button::new(id).ghost().small().label(label)
+    Button::new(id).ghost().small().flex_none().label(label)
 }
 impl TerminalPane {
     pub fn new(
@@ -160,6 +162,7 @@ impl TerminalPane {
             focus: cx.focus_handle(),
             bounds: Default::default(),
             selecting: None,
+            resolved_font: None,
             cell_width: 8.4,
             cell_height: 20.,
             search_found: None,
@@ -615,11 +618,17 @@ impl Render for TerminalPane {
                 .border_b_1()
                 .border_color(rgb(p.border))
                 .child(
-                    div()
+                    Button::new("connection-status")
+                        .ghost()
+                        .small()
                         .flex_1()
+                        .min_w_0()
+                        .justify_start()
                         .text_size(px(11.))
                         .text_color(rgb(if connected { p.accent } else { p.muted }))
-                        .child(status_label),
+                        .label(status_label.clone())
+                        .tooltip(status_label.clone())
+                        .dropdown_menu(move |menu, _, _| menu.label(status_label.clone())),
                 )
                 .child(if connected || busy {
                     action("disconnect", text("Disconnect", "断开")).on_click(cx.listener(
@@ -1095,9 +1104,28 @@ impl Render for TerminalPane {
             return content.into_any_element();
         }
         let font = self.settings.borrow().terminal_font.sanitized();
+        if self
+            .resolved_font
+            .as_ref()
+            .is_none_or(|(previous, _)| *previous != font)
+        {
+            let family = if font.family == "monospace"
+                || cx
+                    .text_system()
+                    .all_font_names()
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&font.family))
+            {
+                font.family.clone()
+            } else {
+                "monospace".into()
+            };
+            self.resolved_font = Some((font.clone(), family));
+        }
+        let family = self.resolved_font.as_ref().unwrap().1.clone();
         let font_id = cx
             .text_system()
-            .resolve_font(&gpui_kit::font(font.family.clone()));
+            .resolve_font(&gpui_kit::font(family.clone()));
         let cell_width = f32::from(
             cx.text_system()
                 .advance(font_id, px(font.size as f32), 'M')
@@ -1232,7 +1260,7 @@ impl Render for TerminalPane {
                 .absolute()
                 .top_0()
                 .left_0()
-                .font_family(font.family.clone())
+                .font_family(family.clone())
                 .text_size(px(font.size as f32))
                 .line_height(px(cell_height));
             for (y, cells) in cells.into_iter().enumerate() {
@@ -1288,7 +1316,7 @@ impl Render for TerminalPane {
                         .top(px(row as f32 * cell_height))
                         .bg(rgb(p.editor))
                         .text_color(rgb(p.text))
-                        .font_family(font.family.clone())
+                        .font_family(family.clone())
                         .text_size(px(font.size as f32))
                         .border_b_1()
                         .border_color(rgb(p.accent))

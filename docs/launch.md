@@ -34,3 +34,9 @@ Platform association installation is opt-in:
 Run `python3 scripts/launch_smoke.py` after building all binaries. It validates help/version, sanitized failures, invalid OS UTF-8, and proxy stdin delivery against a harmless sibling stub. It never runs an association installer.
 
 `python3 scripts/desktop_entry_smoke.py` validates the actual Linux generator through GLib key-file/argument parsing, including spaces, backslash, quote, dollar, backtick, literal percent and separate `%u`, without installing an association. The current container GLib desktop launcher rejects an executable path containing `%%` before field expansion; the generator retains the required desktop-entry escaping. Native desktop integration with percent-containing installation paths remains a platform-validation limitation.
+
+## Production packages and exit
+
+`scripts/package.py` bundles the main app, both proxies, URI assets and a SHA256 manifest. Windows uses the GUI subsystem and attaches to a parent console without allocating a new one; inherited redirected streams remain intact. `scripts/portable_smoke.py` checks actual streams, exit codes and the Windows PE subsystem.
+
+Close window / Continue in background preserve the process-owned launch channel. Quit HelixLane (Cmd/Ctrl+Q or the app menu/settings action) saves settings and ends the application and its in-process work. Running the executable while windowless opens the running workspace.

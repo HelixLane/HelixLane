@@ -134,6 +134,7 @@ impl Terminal {
     pub fn find(&mut self, query: &str, backwards: bool) -> bool {
         if query.is_empty() || query.len() > 4096 {
             self.last_search = None;
+            self.term.selection = None;
             return false;
         }
         let mut text = String::new();
@@ -199,6 +200,7 @@ impl Terminal {
         };
         let Some(found) = found.cloned() else {
             self.last_search = None;
+            self.term.selection = None;
             return false;
         };
         self.term.scroll_to_point(*found.start());
@@ -240,6 +242,7 @@ mod tests {
         t.resize(10, 3);
         assert!(t.find("marker", false));
         assert!(!t.find("absent", false));
+        assert_eq!(t.selection(), None);
         assert!(!t.find("", false));
         let mut t = Terminal::new(8, 2);
         t.feed(b"123456needle");

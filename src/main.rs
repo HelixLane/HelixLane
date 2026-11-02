@@ -11,15 +11,19 @@ use gpui_kit::{App, KeyBinding, actions, application, init};
 
 actions!(helixlane, [Quit, NewWindow, CloseWindow]);
 
-fn register_actions(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx| {
-        if let Some(owner) = cx.try_global::<application::ApplicationOwner>().cloned() {
-            let _ = owner.save();
-            cx.quit();
-        } else {
-            cx.quit();
+pub(crate) fn quit_application(cx: &mut App) {
+    if let Some(owner) = cx.try_global::<application::ApplicationOwner>().cloned() {
+        for id in owner.windows() {
+            if let Some((_, view)) = owner.window(id) {
+                let _ = view.update(cx, |view, cx| view.snapshot_layout(cx));
+            }
         }
-    });
+        let _ = owner.save();
+    }
+    cx.quit();
+}
+fn register_actions(cx: &mut App) {
+    cx.on_action(|_: &Quit, cx| cx.defer(quit_application));
     cx.on_action(|_: &NewWindow, cx| {
         if let Some(owner) = cx.try_global::<application::ApplicationOwner>().cloned() {
             let _ = owner.create(None, cx);

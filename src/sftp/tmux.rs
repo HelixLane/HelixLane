@@ -76,7 +76,13 @@ mod real_server_tests {
             eprintln!("SKIP real tmux server: tmux executable unavailable");
             return;
         }
-        let root = std::env::temp_dir().join(format!(
+        // macOS TMPDIR can exceed sockaddr_un's path limit with the unique suffix.
+        let root_base = if cfg!(unix) {
+            std::path::PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let root = root_base.join(format!(
             "helixlane-tmux-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

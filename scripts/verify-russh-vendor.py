@@ -19,5 +19,14 @@ for name, digest in expected.items():
     if name == "src/keys/format/pkcs8.rs":
         assert content.count(b"pkcs1::RsaPrivateKeyRef::try_from") == 1
         content = content.replace(b"pkcs1::RsaPrivateKeyRef::try_from", b"pkcs1::RsaPrivateKey::try_from")
+    if name == "README.md":
+        lines = content.splitlines(keepends=True)
+        assert lines[2] == b'[![Crate](https://img.shields.io/crates/v/russh.svg)](https://crates.io/crates/russh)\n'
+        lines[2] = b'[![Crate](https://img.shields.io/crates/v/russh.svg)](https://crates.io/crates/russh) \n'
+        assert lines[131] == b'Russh is built to withstand malicious/misbehaving peers.\n'
+        lines[131] = b'Russh is built to withstand malicious/misbehaving peers. \n'
+        assert lines[188] == b'Russh began as a fork of [Thrussh](https://nest.pijul.com/pijul/thrussh) by Pierre-\xc3\x89tienne Meunier, originally extended to provide the SSH backend for [Warpgate](https://github.com/warp-tech/warpgate).\n'
+        lines[188] = b'Russh began as a fork of [Thrussh](https://nest.pijul.com/pijul/thrussh) by Pierre-\xc3\x89tienne Meunier, originally extended to provide the SSH backend for [Warpgate](https://github.com/warp-tech/warpgate). \n'
+        content = b"".join(lines)
     assert hashlib.sha256(content).hexdigest() == digest, f"Unexpected change: {name}"
-print(f"PASS: {len(expected)} upstream files match; only two manifest pins and one borrowed PKCS#1 type alias differ")
+print(f"PASS: {len(expected)} upstream files match; only two manifest pins, one borrowed PKCS#1 type alias and three exact README whitespace normalizations differ")
