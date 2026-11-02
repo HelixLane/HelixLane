@@ -1102,7 +1102,12 @@ async fn controlled_peer(
 }
 async fn server_handle(events: &mut mpsc::UnboundedReceiver<PeerEvent>) -> server::Handle {
     loop {
-        if let PeerEvent::Ready(handle) = events.recv().await.unwrap() {
+        if let PeerEvent::Ready(handle) =
+            tokio::time::timeout(Duration::from_secs(3), events.recv())
+                .await
+                .expect("fixture did not publish authenticated server handle")
+                .unwrap()
+        {
             return handle;
         }
     }
@@ -1185,7 +1190,12 @@ fn remote_stop_closes_accepted_queued_channel_and_restores_capacity() {
             },
         );
         let allocated = loop {
-            if let PeerEvent::Allocated(port) = events.recv().await.unwrap() {
+            if let PeerEvent::Allocated(port) =
+                tokio::time::timeout(Duration::from_secs(3), events.recv())
+                    .await
+                    .expect("fixture did not allocate remote listener")
+                    .unwrap()
+            {
                 break port;
             }
         };
@@ -1195,9 +1205,12 @@ fn remote_stop_closes_accepted_queued_channel_and_restores_capacity() {
         let barrier = std::thread::spawn(move || {
             let _guard = locked.state.lock().unwrap();
             held.send(()).unwrap();
-            let _ = released.recv();
+            released.recv_timeout(Duration::from_secs(4))
         });
-        acquired.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), acquired)
+            .await
+            .expect("fixture state-lock barrier did not start")
+            .unwrap();
         gate.notify_one();
         let address = listening(&job).await;
         assert_eq!(u32::from(address.port()), allocated);
@@ -1212,7 +1225,10 @@ fn remote_stop_closes_accepted_queued_channel_and_restores_capacity() {
         // guarantees that the worker cannot yet have started a copy task.
         job.stop();
         release.send(()).unwrap();
-        barrier.join().unwrap();
+        barrier
+            .join()
+            .unwrap()
+            .expect("fixture barrier expired before Stop; queued admission was not proven");
         stopped(&job).await;
         let closed = tokio::time::timeout(Duration::from_millis(700), accepted.wait()).await;
         assert!(
