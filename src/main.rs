@@ -6,9 +6,34 @@ mod tmux_ui;
 
 use app::HelixLane;
 use gpui_kit::component::TitleBar;
-use gpui_kit::*;
+use gpui_kit::{
+    App, AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
+    application, assets, init, open_window, px, size,
+};
 
 actions!(helixlane, [Quit]);
+
+fn register_actions(cx: &mut App) {
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    let quit = KeyBinding::load("secondary-q", Box::new(Quit), None, false, None, cx)
+        .expect("Platform quit binding must parse");
+    cx.bind_keys([quit]);
+}
+
+#[cfg(all(test, feature = "shell-tests"))]
+mod startup_tests {
+    use super::register_actions;
+    use gpui_kit as gpui;
+    use gpui_kit::{Keystroke, TestAppContext};
+    #[gpui::test]
+    fn startup_registers_platform_quit_binding(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            register_actions(cx);
+            let key = Keystroke::parse_with_os("secondary-q", cx.platform_info().os).unwrap();
+            assert_eq!(cx.all_bindings_for_input(&[key]).len(), 1);
+        });
+    }
+}
 
 fn main() -> std::process::ExitCode {
     let args = match helixlane::launch::os_arguments() {
@@ -106,8 +131,7 @@ fn main() -> std::process::ExitCode {
     application.run(move |cx| {
         gpui_shell::init(cx);
         init(cx);
-        cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
+        register_actions(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
