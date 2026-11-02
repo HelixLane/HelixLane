@@ -8,7 +8,7 @@ use gpui_kit::{
         Sizable,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
-        menu::DropdownMenu,
+        menu::{DropdownMenu, PopupMenuItem},
     },
     prelude::FluentBuilder as _,
     *,
@@ -596,6 +596,19 @@ impl Render for TerminalPane {
                 language.ssh_message(e)
             ),
         };
+        // Keep variable-length server/hop errors out of the action row entirely.
+        // The full diagnostic remains in the tooltip and bounded details popup.
+        let compact_status = match &status {
+            Status::Connecting => text("Connecting…", "连接中…"),
+            Status::Authenticating => text("Authenticating", "认证中"),
+            Status::Connected if terminal_status == TerminalStatus::Finished => {
+                text("Shell finished", "Shell 已结束")
+            }
+            Status::Connected => text("Connected", "已连接"),
+            Status::Disconnected => text("Disconnected", "未连接"),
+            Status::HostKey { .. } => text("Verify host", "验证主机"),
+            Status::Failed(_) => text("Failed", "连接失败"),
+        };
         if let Some(notice) = self
             .session
             .as_ref()
@@ -612,7 +625,8 @@ impl Render for TerminalPane {
         }
         content = content.child(
             row()
-                .h(px(36.))
+                .min_h(px(36.))
+                .flex_wrap()
                 .px_3()
                 .gap_2()
                 .border_b_1()
@@ -621,14 +635,27 @@ impl Render for TerminalPane {
                     Button::new("connection-status")
                         .ghost()
                         .small()
-                        .flex_1()
+                        .w(px(104.))
+                        .flex_none()
                         .min_w_0()
                         .justify_start()
                         .text_size(px(11.))
                         .text_color(rgb(if connected { p.accent } else { p.muted }))
-                        .label(status_label.clone())
+                        .label(compact_status)
                         .tooltip(status_label.clone())
-                        .dropdown_menu(move |menu, _, _| menu.label(status_label.clone())),
+                        .dropdown_menu(move |menu, _, _| {
+                            let details = status_label.clone();
+                            menu.max_w(px(400.)).max_h(px(240.)).scrollable(true).item(
+                                PopupMenuItem::element(move |_, _| {
+                                    div()
+                                        .w(px(360.))
+                                        .min_w_0()
+                                        .whitespace_normal()
+                                        .child(details.clone())
+                                })
+                                .disabled(true),
+                            )
+                        }),
                 )
                 .child(if connected || busy {
                     action("disconnect", text("Disconnect", "断开")).on_click(cx.listener(

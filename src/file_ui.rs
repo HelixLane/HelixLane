@@ -8,6 +8,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
         menu::{DropdownMenu, PopupMenuItem},
+        tooltip::Tooltip,
     },
     prelude::FluentBuilder as _,
     *,
@@ -764,6 +765,11 @@ impl FilePane {
             },
         )
         .dropdown_menu(move |mut menu, _, _| {
+            menu = menu
+                .min_w(px(360.))
+                .max_w(px(440.))
+                .max_h(px(360.))
+                .scrollable(true);
             if targets.is_empty() {
                 return menu.label(if zh {
                     "请先在其他文件视图连接目标服务器"
@@ -771,22 +777,47 @@ impl FilePane {
                     "Connect a destination in another file view"
                 });
             }
-            for (id, endpoint, path) in &targets {
+            for (index, (name, endpoint, path)) in targets.iter().enumerate() {
                 let endpoint = endpoint.clone();
                 let path = path.clone();
+                let summary = format!("{} · {}", name, endpoint.label());
+                let destination = path.clone();
+                let full_label = format!("{summary}\n{destination}");
                 let weak = owner.clone();
                 menu = menu.item(
-                    PopupMenuItem::new(format!("{} · {} · {}", id, endpoint.label(), path))
-                        .on_click(move |_, _, cx| {
-                            let _ = weak.update(cx, |this, _| {
-                                this.cross_copy(
-                                    endpoint.clone(),
-                                    path.clone(),
-                                    generation,
-                                    conflict,
-                                )
-                            });
-                        }),
+                    PopupMenuItem::element(move |_, cx| {
+                        let tooltip = full_label.clone();
+                        div()
+                            .id(("copy-destination-details", index))
+                            .aria_label(full_label.clone())
+                            .w(px(400.))
+                            .min_w_0()
+                            .overflow_hidden()
+                            .flex()
+                            .flex_col()
+                            .py_1()
+                            .gap_1()
+                            .child(div().w_full().truncate().child(summary.clone()))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(Palette::current(cx).muted))
+                                    .child(destination.clone()),
+                            )
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(tooltip.clone())
+                                    .max_w(px(560.))
+                                    .whitespace_normal()
+                                    .build(window, cx)
+                            })
+                    })
+                    .on_click(move |_, _, cx| {
+                        let _ = weak.update(cx, |this, _| {
+                            this.cross_copy(endpoint.clone(), path.clone(), generation, conflict)
+                        });
+                    }),
                 );
             }
             menu
