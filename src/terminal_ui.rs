@@ -20,6 +20,7 @@ use helixlane::{
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 pub struct TerminalPane {
+    transport_only: bool,
     view_id: u64,
     settings: Rc<RefCell<Settings>>,
     profile: ConnectionProfile,
@@ -79,6 +80,7 @@ impl TerminalPane {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Find in visible screen"));
         let search_subscription = cx.observe(&search, |_, _, cx| cx.notify());
         Self {
+            transport_only: false,
             _search_subscription: search_subscription,
             preedit: String::new(),
             composition_target: None,
@@ -105,6 +107,17 @@ impl TerminalPane {
             selecting: None,
         }
     }
+    pub fn transport_only(&mut self) {
+        self.transport_only = true;
+    }
+    pub fn session_identity(&self) -> Option<u64> {
+        self.session.as_ref().map(|s| s.id)
+    }
+    pub fn shared_session(&self) -> Option<Arc<Session>> {
+        self.session
+            .clone()
+            .filter(|s| s.state.lock().unwrap().status == Status::Connected)
+    }
     pub fn bind(
         &mut self,
         profile: ConnectionProfile,
@@ -121,7 +134,17 @@ impl TerminalPane {
             .iter()
             .rev()
             .find(|s| s.profile == self.profile)
-            .cloned();
+            .cloned()
+            .or_else(|| {
+                if self.transport_only {
+                    Service::global()
+                        .resumable(&self.profile)
+                        .into_iter()
+                        .last()
+                } else {
+                    None
+                }
+            });
         self.password
             .update(cx, |s, cx| s.set_value("", window, cx));
         let path = match &self.profile.auth {
@@ -174,7 +197,11 @@ impl TerminalPane {
         let secret = Secret::new(self.password.read(cx).value().to_string());
         self.password
             .update(cx, |s, cx| s.set_value("", window, cx));
-        let session = Service::global().connect(self.profile.clone(), secret, self.remember);
+        let session = if self.transport_only {
+            Service::global().connect_transport(self.profile.clone(), secret, self.remember)
+        } else {
+            Service::global().connect(self.profile.clone(), secret, self.remember)
+        };
         self.sessions.push(session.clone());
         if let Some(view) = self
             .settings
@@ -305,7 +332,8 @@ impl Render for TerminalPane {
         let mut content = div()
             .flex()
             .flex_col()
-            .size_full()
+            .w_full()
+            .when(!self.transport_only, |d| d.h_full())
             .min_w_0()
             .min_h_0()
             .bg(rgb(p.editor));
@@ -375,14 +403,16 @@ impl Render for TerminalPane {
                     action("connect", text("Connect", "连接"))
                         .on_click(cx.listener(|this, _, w, cx| this.connect(w, cx)))
                 })
-                .child(
-                    action("copy", text("Copy", "复制"))
-                        .on_click(cx.listener(|this, _, _, cx| this.copy(cx))),
-                )
-                .child(
-                    action("paste", text("Paste", "粘贴"))
-                        .on_click(cx.listener(|this, _, _, cx| this.paste_clipboard(cx))),
-                ),
+                .when(!self.transport_only, |d| {
+                    d.child(
+                        action("copy", text("Copy", "复制"))
+                            .on_click(cx.listener(|this, _, _, cx| this.copy(cx))),
+                    )
+                    .child(
+                        action("paste", text("Paste", "粘贴"))
+                            .on_click(cx.listener(|this, _, _, cx| this.paste_clipboard(cx))),
+                    )
+                }),
         );
         if self.session.is_none() {
             for session in Service::global().resumable(&self.profile) {
@@ -500,6 +530,9 @@ impl Render for TerminalPane {
                 .child(div().text_size(px(11.)).child(format!("{}: {fingerprint}",text("Presented","新指纹"))))
                 .child(div().text_size(px(11.)).child(text("Compare this SHA256 fingerprint with a trusted source. Accepting stores this host identity.","请通过可信渠道核对 SHA256 指纹。接受后将保存此主机身份。")))
                 .child(row().gap_2().child(action("reject",text("Reject","拒绝")).on_click(cx.listener(|this,_,_,_|{if let Some(s)=&this.session {s.trust(false);}}))).child(action("trust",if changed {text("Replace trusted key","替换受信任密钥")} else {text("Trust and connect","信任并连接")}).on_click(cx.listener(|this,_,_,_|{if let Some(s)=&this.session {s.trust(true);}})))));
+        }
+        if self.transport_only {
+            return content.into_any_element();
         }
         let query = self.search.read(cx).value().to_string();
         if self.session.is_some() {

@@ -185,17 +185,22 @@ pub enum ToolKind {
     Transfers,
     Services,
     Information,
+    Tmux,
 }
 impl ToolKind {
     pub fn resource_scoped(self) -> bool {
-        matches!(self, Self::Terminal | Self::Sftp | Self::Information)
+        matches!(
+            self,
+            Self::Terminal | Self::Sftp | Self::Information | Self::Tmux
+        )
     }
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Terminal,
         Self::Sftp,
         Self::Transfers,
         Self::Services,
         Self::Information,
+        Self::Tmux,
     ];
     pub fn key(self) -> &'static str {
         match self {
@@ -204,6 +209,7 @@ impl ToolKind {
             Self::Transfers => "transfers",
             Self::Services => "services",
             Self::Information => "information",
+            Self::Tmux => "tmux",
         }
     }
 }

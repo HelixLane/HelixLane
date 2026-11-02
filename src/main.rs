@@ -1,6 +1,8 @@
 mod app;
+mod file_ui;
 mod terminal_ui;
 mod theme;
+mod tmux_ui;
 
 use app::HelixLane;
 use gpui_kit::component::TitleBar;

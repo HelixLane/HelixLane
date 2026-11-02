@@ -77,6 +77,9 @@ impl HelixLane {
                 owner: owner.clone(),
                 focus: cx.focus_handle(),
                 terminal: None,
+                files: None,
+                tmux: None,
+                transfers: None,
             });
             map.borrow_mut().insert(id, p.clone());
             panel_handle(p)
@@ -289,6 +292,9 @@ impl HelixLane {
                 owner,
                 focus: cx.focus_handle(),
                 terminal: None,
+                files: None,
+                tmux: None,
+                transfers: None,
             });
             self.panels.borrow_mut().insert(id, p.clone());
             groups.push((id, DockLayout::tabs().panel_view(panel_handle(p), cx)));
@@ -351,6 +357,9 @@ impl HelixLane {
                 owner,
                 focus: pcx.focus_handle(),
                 terminal: None,
+                files: None,
+                tmux: None,
+                transfers: None,
             })
         });
         self.panels.borrow_mut().insert(id, panel.clone());
@@ -645,6 +654,7 @@ impl HelixLane {
             (2, ToolKind::Services, IconName::LayoutDashboard),
             (3, ToolKind::Transfers, IconName::ArrowDown),
             (4, ToolKind::Information, IconName::Info),
+            (5, ToolKind::Tmux, IconName::SquareTerminal),
         ] {
             rail = rail.child(
                 Button::new(("tool-rail", index))
@@ -932,6 +942,9 @@ struct ToolPanel {
     owner: WeakEntity<HelixLane>,
     focus: FocusHandle,
     terminal: Option<Entity<crate::terminal_ui::TerminalPane>>,
+    files: Option<Entity<crate::file_ui::FilePane>>,
+    tmux: Option<Entity<crate::tmux_ui::TmuxPane>>,
+    transfers: Option<Entity<crate::file_ui::TransfersPane>>,
 }
 impl EventEmitter<PanelEvent> for ToolPanel {}
 impl Focusable for ToolPanel {
@@ -939,6 +952,16 @@ impl Focusable for ToolPanel {
         self.terminal
             .as_ref()
             .map(|terminal| terminal.read(cx).focus_handle(cx))
+            .or_else(|| {
+                self.files
+                    .as_ref()
+                    .map(|files| files.read(cx).focus_handle(cx))
+            })
+            .or_else(|| {
+                self.tmux
+                    .as_ref()
+                    .map(|pane| pane.read(cx).focus_handle(cx))
+            })
             .unwrap_or_else(|| self.focus.clone())
     }
 }
@@ -954,6 +977,12 @@ impl BasePanel for ToolPanel {
         }
     }
     fn set_active(&mut self, active: bool, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(files) = &self.files {
+            files.update(cx, |pane, _| pane.set_visible(active));
+        }
+        if let Some(tmux) = &self.tmux {
+            tmux.update(cx, |pane, _| pane.set_visible(active));
+        }
         if active {
             let target = {
                 let s = self.settings.borrow();
@@ -962,7 +991,10 @@ impl BasePanel for ToolPanel {
                     .iter()
                     .find(|v| v.id == self.id)
                     .and_then(|v| match (v.tool, v.mode) {
-                        (ToolKind::Terminal | ToolKind::Sftp, TargetMode::Fixed(id)) => Some(id),
+                        (
+                            ToolKind::Terminal | ToolKind::Sftp | ToolKind::Tmux,
+                            TargetMode::Fixed(id),
+                        ) => Some(id),
                         _ => None,
                     })
             };
@@ -1187,6 +1219,7 @@ impl ToolPanel {
                                 ToolKind::Services => IconName::LayoutDashboard,
                                 ToolKind::Transfers => IconName::ArrowDown,
                                 ToolKind::Information => IconName::Info,
+                                ToolKind::Tmux => IconName::SquareTerminal,
                             })
                             .text_color(rgb(p.muted)),
                         )
@@ -1291,11 +1324,15 @@ impl Render for ToolPanel {
         });
         let content = match v.tool {
             ToolKind::Services => self.services(p, language, cx),
-            ToolKind::Transfers => div()
-                .p_5()
-                .text_color(rgb(p.muted))
-                .child(language.text("no_tasks"))
-                .into_any_element(),
+            ToolKind::Transfers => {
+                let pane = self
+                    .transfers
+                    .get_or_insert_with(|| {
+                        cx.new(|cx| crate::file_ui::TransfersPane::new(self.settings.clone(), cx))
+                    })
+                    .clone();
+                div().size_full().min_h_0().child(pane).into_any_element()
+            }
             ToolKind::Information => {
                 let mut info = div().p_5().flex().flex_col().gap_3();
                 if let Some(r) = resource {
@@ -1335,42 +1372,49 @@ impl Render for ToolPanel {
                     div().p_5().child(language.text("empty")).into_any_element()
                 }
             }
+            ToolKind::Tmux => {
+                if let Some(profile) = resource.as_ref().and_then(|r| r.profiles.first()).cloned() {
+                    let pane = self
+                        .tmux
+                        .get_or_insert_with(|| {
+                            cx.new(|cx| {
+                                crate::tmux_ui::TmuxPane::new(
+                                    self.id,
+                                    profile.clone(),
+                                    self.settings.clone(),
+                                    window,
+                                    cx,
+                                )
+                            })
+                        })
+                        .clone();
+                    pane.update(cx, |pane, cx| pane.bind(profile, window, cx));
+                    div().size_full().min_h_0().child(pane).into_any_element()
+                } else {
+                    div().p_5().child(language.text("empty")).into_any_element()
+                }
+            }
             ToolKind::Sftp => {
-                let pane = |label: &'static str, path: String| {
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w_0()
-                        .gap_3()
-                        .p_4()
-                        .border_1()
-                        .border_color(rgb(p.border))
-                        .rounded(px(7.))
-                        .child(row().gap_2().child(icon(IconName::Folder)).child(label))
-                        .child(div().text_color(rgb(p.muted)).child(path))
-                        .child(
-                            div()
-                                .mt_6()
-                                .text_color(rgb(p.muted))
-                                .child(language.text("no_connection")),
-                        )
-                };
-                row()
-                    .items_stretch()
-                    .flex_1()
-                    .min_h_0()
-                    .p_3()
-                    .gap_3()
-                    .child(pane(language.text("local"), "—".into()))
-                    .child(pane(
-                        language.text("remote"),
-                        resource
-                            .as_ref()
-                            .map(|r| r.profiles[0].host.clone())
-                            .unwrap_or_else(|| "—".into()),
-                    ))
-                    .into_any_element()
+                if let Some(profile) = resource.as_ref().and_then(|r| r.profiles.first()).cloned() {
+                    let pane = self
+                        .files
+                        .get_or_insert_with(|| {
+                            cx.new(|cx| {
+                                crate::file_ui::FilePane::new(
+                                    self.id,
+                                    profile.clone(),
+                                    self.settings.clone(),
+                                    window,
+                                    cx,
+                                )
+                            })
+                        })
+                        .clone();
+                    pane.update(cx, |pane, cx| pane.bind(profile, window, cx));
+                    div().size_full().min_h_0().child(pane).into_any_element()
+                } else {
+                    div().p_5().child(language.text("empty")).into_any_element()
+                }
             }
         };
         div()

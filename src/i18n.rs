@@ -17,6 +17,7 @@ impl Language {
     pub fn text(self, key: &str) -> &'static str {
         let zh = self == Self::Chinese;
         match key {
+            "tmux" => "tmux",
             "recovered_layout" => {
                 if zh {
                     "部分布局无法恢复，已保留并重新打开视图。"
@@ -473,6 +474,64 @@ impl Language {
             "Private-key task failed" => "私钥加载失败",
             "Missing keychain reference" => "缺少钥匙串引用",
             _ => error,
+        }
+    }
+}
+
+impl Language {
+    pub fn file_error(self, error: &str) -> &str {
+        if self != Self::Chinese {
+            return error;
+        }
+        if error.starts_with("Incompatible destination type") {
+            return "目标类型不兼容，原目标保持不变";
+        }
+        if error.starts_with("Source changed") {
+            return "源文件已变化，请重新选择传输";
+        }
+        if error.starts_with("Target changed") {
+            return "目标已变化，请重新确认操作";
+        }
+        if error.starts_with("Remote file changed") {
+            return "远程文件已变化，请重新下载或解决冲突";
+        }
+        match error {
+            "Source missing" => "源文件不存在",
+            "Invalid path" => "路径无效",
+            "Select an entry first" => "请先选择文件或目录",
+            "Select one entry" => "请选择一个文件或目录",
+            "Target exists" => "目标已存在",
+            "Directory conflict" => "目标目录类型冲突",
+            "Invalid directory name" => "目录名称无效",
+            "Select one entry and enter a valid name" => "请选择一个文件或目录并输入有效名称",
+            "Enter octal permissions, e.g. 644" => "请输入八进制权限，例如 644",
+            "Invalid permissions" => "权限无效",
+            "Refusing to follow symlink" => "为安全起见，不跟随符号链接",
+            "Refusing to follow symlink or non-file" => "不能读取符号链接或非常规文件",
+            "Only regular files can be edited" => "只能编辑常规文件",
+            "Choose an external editor executable" => "请选择外部编辑器可执行文件",
+            "Unsafe editor temporary directory" => "编辑器临时目录不安全",
+            "External edit limit is 32 MiB" => "外部编辑文件最大支持 32 MiB",
+            "No saved changes detected" => "未检测到保存的更改",
+            "SFTP subsystem timed out" => "SFTP 子系统连接超时",
+            "Invalid tmux name" => "tmux 会话名称无效",
+            "tmux command failed; check installation and session availability" => {
+                "tmux 命令失败，请检查是否已安装以及会话是否可用"
+            }
+            "Select a running target terminal instance" => "请选择正在运行的目标终端实例",
+            "Target terminal connection changed" => "目标终端连接已变化",
+            "Target cannot be source or a child of source" => "目标不能与源相同或位于源目录内",
+            "Local staging path already exists" => "本机中转路径已存在",
+            "Backup path exists" => "备份路径已存在",
+            "Cancelled" => "已取消",
+            "Recovery is already being validated" => "此恢复任务正在验证，请等待完成",
+            "Recovery missing" => "恢复任务已被处理或忽略",
+            "Task missing" => "任务不存在",
+            "Task is not retryable" => "此任务不能重试",
+            "Reconnect and verify the captured connection profile before recovering this task" => {
+                "请按任务原连接配置重新连接并验证主机，再恢复此任务"
+            }
+            _ => self.ssh_error(error),
         }
     }
 }
