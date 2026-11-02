@@ -94,7 +94,7 @@ fn context_value(context: ToolContext) -> HostValue {
 }
 
 pub fn resource_module(instance: &ToolInstance, language: Language) -> HostModule {
-    let context = instance.resource_context();
+    let context = instance.collection_context();
     let lease = instance.lease();
     let labels_lease = lease.clone();
     let activity = instance.collection_activity();
@@ -106,7 +106,7 @@ pub fn resource_module(instance: &ToolInstance, language: Language) -> HostModul
             if !activity.get() {
                 return Err(HostError::new("Collection paused"));
             }
-            context.clone().map(context_value).map_err(HostError::new)
+            context().map(context_value).map_err(HostError::new)
         })
         .function("labels", move |_| {
             if !labels_lease.is_active() {
@@ -125,6 +125,7 @@ pub struct NativePlugin {
     // Revoke before dropping ScriptView: old rendered frames may hold its entity.
     instance: ToolInstance,
     view: Option<Entity<ScriptView>>,
+    rendered_context: std::cell::RefCell<ToolContext>,
     _runtime: Rc<ShellRuntime>,
     _bundle: Bundle,
 }
@@ -174,6 +175,7 @@ impl NativePlugin {
                 .map_err(|error| error.to_string())?
         };
         Ok(Self {
+            rendered_context: std::cell::RefCell::new(instance.context().clone()),
             instance,
             view: Some(view),
             _runtime: runtime,
@@ -183,8 +185,17 @@ impl NativePlugin {
     pub fn set_collection_active(&self, active: bool, cx: &mut App) {
         let before = self.instance.collection_activity().get();
         self.instance.set_collection_active(active);
+        let changed = self.instance.resource_context().is_ok_and(|next| {
+            let mut previous = self.rendered_context.borrow_mut();
+            if *previous == next {
+                false
+            } else {
+                *previous = next;
+                true
+            }
+        });
         if active
-            && !before
+            && (!before || changed)
             && let Some(view) = &self.view
         {
             view.update(cx, |view, cx| view.refresh(cx));
@@ -232,6 +243,60 @@ mod tests {
         assert!(!caps.may_reach("example.com"));
         assert!(!caps.has_storage());
         assert!(!caps.may_exit());
+    }
+    #[test]
+    fn hidden_background_host_reads_current_target_without_render_and_keeps_captures() {
+        use super::super::{ResourceCapabilities, ToolProvider};
+        use crate::workspace::{RunPolicy, TargetMode, ToolKind, Workspace};
+        use std::cell::RefCell;
+        let workspace = Rc::new(RefCell::new(Workspace::default()));
+        let id = workspace
+            .borrow_mut()
+            .open(ToolKind::Plugin, TargetMode::Follow);
+        workspace
+            .borrow_mut()
+            .views
+            .iter_mut()
+            .find(|v| v.id == id)
+            .unwrap()
+            .run_policy = RunPolicy::Background;
+        let provider = ToolProvider::plugin(EXAMPLE_ID, ResourceCapabilities::metadata());
+        let mut instance = provider.instantiate(id, &workspace.borrow()).unwrap();
+        let source = workspace.clone();
+        instance.bind_collection_context(move || {
+            provider
+                .instantiate(id, &source.borrow())
+                .and_then(|next| next.resource_context())
+        });
+        let lease = instance.lease();
+        let module = resource_module(&instance, Language::English);
+        let args = gpui_shell::HostArguments::new([]);
+        let captured = module.call("context", &args).unwrap();
+        let old_ticket = workspace.borrow().ticket(id).unwrap();
+        workspace.borrow_mut().activate_resource(2);
+        let next = module.call("context", &args).unwrap();
+        assert_eq!(
+            captured
+                .get("resource")
+                .unwrap()
+                .get("id")
+                .unwrap()
+                .as_number(),
+            Some(1.)
+        );
+        assert_eq!(
+            next.get("resource").unwrap().get("id").unwrap().as_number(),
+            Some(2.)
+        );
+        workspace.borrow_mut().activate_resource(1);
+        assert!(!workspace.borrow().accepts(old_ticket));
+        assert!(lease.is_active(), "retarget must not revoke submitted jobs");
+        instance.set_collection_active(false);
+        assert!(module.call("context", &args).is_err());
+        instance.set_collection_active(true);
+        assert!(module.call("context", &args).is_ok());
+        instance.unload();
+        assert!(module.call("context", &args).is_err());
     }
     #[test]
     fn module_functions_reject_retained_handles_after_unload() {

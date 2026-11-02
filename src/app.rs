@@ -1298,6 +1298,29 @@ impl Render for HelixLane {
                 .into_any_element()
         };
         let mut frame = div()
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<gpui_kit::base::dock::DragPanel>, _, cx| {
+                    let panel = event.drag(cx).panel();
+                    if let Some(id) = this
+                        .panels
+                        .borrow()
+                        .iter()
+                        .find(|(_, p)| PanelId::from(p.entity_id()) == panel)
+                        .map(|(id, _)| *id)
+                    {
+                        this.application.begin_drag(id);
+                    }
+                },
+            ))
+            .capture_any_mouse_up(cx.listener(|this, event, w, cx| {
+                this.application.finish_cross_window_drag(event, w, cx);
+            }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event, w, cx| {
+                    this.application.finish_cross_window_drag(event, w, cx);
+                }),
+            )
             .flex()
             .flex_col()
             .size_full()
@@ -1319,9 +1342,26 @@ impl Render for HelixLane {
             ("top", Location::Top),
             ("bottom", Location::Bottom),
         ] {
+            let app = self.application.clone();
+            let destination = self.window_id;
             drop_targets = drop_targets.child(
                 div()
                     .id(("dock-drop", location as usize))
+                    .relative()
+                    .child(
+                        canvas(
+                            move |bounds, window, _| {
+                                let bounds = Bounds::new(
+                                    window.bounds().origin + bounds.origin,
+                                    bounds.size,
+                                );
+                                app.measure_drop_target(destination, location, bounds);
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
                     .px_2()
                     .rounded(px(4.))
                     .text_size(px(11.))
@@ -1628,6 +1668,8 @@ impl BasePanel for ToolPanel {
 impl Panel for ToolPanel {
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.label();
+        let id = self.id;
+        let application = cx.global::<crate::application::ApplicationOwner>().clone();
         let drag = self
             .drag_node
             .map(|node| gpui_kit::base::dock::DragPanel::new(PanelId::from(cx.entity_id()), node));
@@ -1638,6 +1680,7 @@ impl Panel for ToolPanel {
             .when_some(drag, |element, drag| {
                 element.on_drag(drag, move |drag, offset, _, cx| {
                     cx.stop_propagation();
+                    application.begin_drag(id);
                     drag.set_drag_offset(offset);
                     drag.set_preview_size(size(px(300.), px(32.)));
                     cx.new(|_| ToolDragPreview(title.clone()))
@@ -1872,10 +1915,16 @@ impl ToolPanel {
         if view.plugin_enabled && self.plugin.is_none() && self.plugin_error.is_none() {
             let instance = ToolProvider::plugin(EXAMPLE_ID, ResourceCapabilities::metadata())
                 .instantiate(self.id, &self.settings.borrow().workspace);
-            match instance
-                .map_err(str::to_owned)
-                .and_then(|instance| NativePlugin::mount(instance, language, window, cx))
-            {
+            match instance.map_err(str::to_owned).and_then(|mut instance| {
+                let settings = self.settings.clone();
+                let id = self.id;
+                instance.bind_collection_context(move || {
+                    ToolProvider::plugin(EXAMPLE_ID, ResourceCapabilities::metadata())
+                        .instantiate(id, &settings.borrow().workspace)
+                        .and_then(|next| next.resource_context())
+                });
+                NativePlugin::mount(instance, language, window, cx)
+            }) {
                 Ok(plugin) => self.plugin = Some(plugin),
                 Err(error) => self.plugin_error = Some(error),
             }
@@ -2107,7 +2156,8 @@ impl Render for ToolPanel {
             })
         {
             self.instance = Some(next);
-            self.plugin.take();
+            // Resource collection resolves its current window context at each call;
+            // retain the VM and its independently captured user jobs on retarget.
             self.plugin_error = None;
         }
         drop(state);

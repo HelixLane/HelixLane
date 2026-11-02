@@ -19,6 +19,38 @@ struct Owner {
     path: RefCell<Option<std::path::PathBuf>>,
     panels: Panels,
     windows: RefCell<HashMap<WindowId, (AnyWindowHandle, WeakEntity<HelixLane>)>>,
+    drag: RefCell<CrossWindowDrag>,
+}
+
+/// X11 can retain the mouse grab in the source native window. Its release has
+/// source-local coordinates even when the pointer is over another window.
+/// Keep measured destination strips in screen coordinates and consume once.
+#[derive(Default)]
+struct CrossWindowDrag {
+    view: Option<ViewId>,
+    targets: Vec<(WindowId, Location, Bounds<Pixels>)>,
+}
+impl CrossWindowDrag {
+    fn measure(&mut self, window: WindowId, location: Location, bounds: Bounds<Pixels>) {
+        self.targets
+            .retain(|(w, l, _)| *w != window || *l != location);
+        self.targets.push((window, location, bounds));
+    }
+    fn remove_window(&mut self, window: WindowId) {
+        self.targets.retain(|(w, _, _)| *w != window);
+    }
+    fn finish(
+        &mut self,
+        source: Option<WindowId>,
+        pointer: Point<Pixels>,
+    ) -> Option<(ViewId, WindowId, Location)> {
+        let id = self.view.take()?;
+        self.targets
+            .iter()
+            .rev()
+            .find(|(window, _, bounds)| Some(*window) != source && bounds.contains(&pointer))
+            .map(|(window, location, _)| (id, *window, *location))
+    }
 }
 impl Global for ApplicationOwner {}
 impl ApplicationOwner {
@@ -32,6 +64,9 @@ impl ApplicationOwner {
         owner
     }
     pub(crate) fn install_settings(mut settings: Settings, cx: &mut App) -> Self {
+        // Continue in background owns the process even with no native windows.
+        // GPUI defaults to LastWindowClosed on Linux and Windows.
+        cx.set_quit_mode(QuitMode::Explicit);
         settings.workspace.ensure_windows();
         if let Some(primary) = settings.workspace.windows.iter_mut().find(|w| w.id == 1) {
             if primary.dock_layout.is_none() {
@@ -46,6 +81,7 @@ impl ApplicationOwner {
             path: RefCell::new(None),
             panels: Default::default(),
             windows: Default::default(),
+            drag: Default::default(),
         }));
         cx.set_global(owner.clone());
         let factory = owner.clone();
@@ -94,7 +130,38 @@ impl ApplicationOwner {
         ids.sort_unstable();
         ids
     }
+    pub fn begin_drag(&self, id: ViewId) {
+        self.0.drag.borrow_mut().view = Some(id);
+    }
+    pub fn measure_drop_target(&self, id: WindowId, location: Location, bounds: Bounds<Pixels>) {
+        self.0.drag.borrow_mut().measure(id, location, bounds);
+    }
+    pub fn finish_cross_window_drag(
+        &self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        if !cx.has_active_drag() {
+            self.0.drag.borrow_mut().view = None;
+            return;
+        }
+        let id = self.0.drag.borrow().view;
+        let source = id.and_then(|id| self.settings().borrow().workspace.owner(id));
+        let pointer = window.bounds().origin + event.position;
+        let destination = self.0.drag.borrow_mut().finish(source, pointer);
+        if let Some((id, destination, location)) = destination {
+            cx.stop_active_drag(window);
+            cx.stop_propagation();
+            let owner = self.clone();
+            cx.defer(move |cx| owner.relocate(id, destination, location, cx));
+        }
+    }
     pub fn closed(&self, id: WindowId, cx: &mut App) {
+        self.0.drag.borrow_mut().remove_window(id);
         self.0.windows.borrow_mut().remove(&id);
         self.0.settings.borrow_mut().workspace.close_window(id);
         let _ = self.save();
@@ -292,6 +359,35 @@ impl ApplicationOwner {
 mod tests {
     use super::{ApplicationOwner, Settings, TargetMode, ToolKind};
     use gpui_kit as gpui;
+    #[test]
+    fn cross_window_drop_uses_global_bounds_and_rejects_closed_or_same_window() {
+        use super::{CrossWindowDrag, Location};
+        let mut drag = CrossWindowDrag::default();
+        let bounds = gpui::Bounds::new(
+            gpui::point(gpui::px(160.), gpui::px(45.)),
+            gpui::size(gpui::px(60.), gpui::px(26.)),
+        );
+        drag.measure(1, Location::Top, bounds);
+        drag.view = Some(100);
+        // Source window at x=1100 receives the grabbed pointer at local x=-910.
+        let pointer = gpui::point(gpui::px(1100. - 910.), gpui::px(57.));
+        assert_eq!(
+            drag.finish(Some(200), pointer),
+            Some((100, 1, Location::Top))
+        );
+        assert!(
+            drag.finish(Some(200), pointer).is_none(),
+            "drop consumed once"
+        );
+        drag.view = Some(100);
+        assert!(
+            drag.finish(Some(1), pointer).is_none(),
+            "Kit owns same-window drops"
+        );
+        drag.view = Some(100);
+        drag.remove_window(1);
+        assert!(drag.finish(Some(200), pointer).is_none());
+    }
     #[gpui::test]
     fn registry_keeps_one_entity_when_moving_between_native_window_roots(
         cx: &mut gpui::TestAppContext,

@@ -93,6 +93,7 @@ impl ToolProvider {
             capabilities: self.capabilities,
             lease: ToolLease(Rc::new(Cell::new(true))),
             collection: Rc::new(Cell::new(true)),
+            collection_context: None,
             cleanup: Vec::new(),
         })
     }
@@ -104,6 +105,8 @@ impl ToolLease {
         self.0.get()
     }
 }
+pub type CollectionContext = Rc<dyn Fn() -> Result<ToolContext, &'static str>>;
+
 pub struct ToolInstance {
     // Only trusted builtin providers receive connection profiles. Never serialize
     // ToolInstance or expose this field from a script HostModule.
@@ -112,6 +115,7 @@ pub struct ToolInstance {
     capabilities: ResourceCapabilities,
     lease: ToolLease,
     collection: Rc<Cell<bool>>,
+    collection_context: Option<CollectionContext>,
     cleanup: Vec<Box<dyn FnOnce()>>,
 }
 impl ToolInstance {
@@ -127,6 +131,28 @@ impl ToolInstance {
     pub fn collection_activity(&self) -> Rc<Cell<bool>> {
         self.collection.clone()
     }
+    /// Resolve only future collection calls. Returned contexts remain immutable snapshots,
+    /// and rebinding does not revoke the separate lease held by submitted user jobs.
+    pub fn bind_collection_context(
+        &mut self,
+        source: impl Fn() -> Result<ToolContext, &'static str> + 'static,
+    ) {
+        self.collection_context = Some(Rc::new(source));
+    }
+    pub fn collection_context(&self) -> CollectionContext {
+        let permitted = self.capabilities.metadata;
+        let context = self.context.clone();
+        let source = self.collection_context.clone();
+        Rc::new(move || {
+            if !permitted {
+                return Err("Resource metadata permission denied");
+            }
+            match &source {
+                Some(source) => source(),
+                None => Ok(context.clone()),
+            }
+        })
+    }
     pub fn resource_context(&self) -> Result<ToolContext, &'static str> {
         if !self.lease.is_active() {
             return Err("Plugin is unloaded");
@@ -137,7 +163,7 @@ impl ToolInstance {
         if !self.capabilities.metadata {
             return Err("Resource metadata permission denied");
         }
-        Ok(self.context.clone())
+        (self.collection_context())()
     }
     pub fn lease(&self) -> ToolLease {
         self.lease.clone()
