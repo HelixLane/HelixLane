@@ -1,5 +1,47 @@
 //! An edit lease captures its remote session and original full-file digest.
 use super::*;
+// A cancelled preparation future must not leave a partial private download.
+// Completed/opened leases retain the existing independent EditorManager lifetime.
+struct PendingDownload {
+    path: std::path::PathBuf,
+    keep: bool,
+}
+impl Drop for PendingDownload {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+async fn copy_to_temporary(
+    input: impl tokio::io::AsyncRead + Unpin,
+    local: &std::path::Path,
+) -> Result<(u64, PendingDownload), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Create and arm cleanup without an await gap. create_new never replaces
+    // another job's file, and the guard owns only a successfully created path.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(local).map_err(err)?;
+    let pending = PendingDownload {
+        path: local.into(),
+        keep: false,
+    };
+    let mut output = tokio::fs::File::from_std(file);
+    let mut input = input.take(32 * 1024 * 1024 + 1);
+    let bytes = tokio::io::copy(&mut input, &mut output)
+        .await
+        .map_err(err)?;
+    output.shutdown().await.map_err(err)?;
+    drop(output);
+    Ok((bytes, pending))
+}
+
 pub struct EditLease {
     pub endpoint: Endpoint,
     pub remote: String,
@@ -45,16 +87,8 @@ impl EditLease {
                 .as_nanos(),
             remote.rsplit('/').next().unwrap_or("file")
         ));
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut input = endpoint.reader(&remote).await?.take(32 * 1024 * 1024 + 1);
-        let mut output = Endpoint::Local
-            .create_new(&local.display().to_string())
-            .await?;
-        let bytes = tokio::io::copy(&mut input, &mut output)
-            .await
-            .map_err(err)?;
-        output.shutdown().await.map_err(err)?;
-        drop(output);
+        let input = endpoint.reader(&remote).await?;
+        let (bytes, mut pending) = copy_to_temporary(input, &local).await?;
         if bytes > 32 * 1024 * 1024 || Fingerprint::capture(&endpoint, &remote).await? != baseline {
             let _ = tokio::fs::remove_file(&local).await;
             return Err(if bytes > 32 * 1024 * 1024 {
@@ -67,6 +101,7 @@ impl EditLease {
 
         let local_digest =
             Fingerprint::capture(&Endpoint::Local, &local.display().to_string()).await?;
+        pending.keep = true;
         Ok(Self {
             endpoint,
             remote,
@@ -237,5 +272,55 @@ mod tests {
             assert!(!lease.saved().await.unwrap());
         }
         assert_eq!(manager.jobs().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    use crate::sftp::jobs::{CANCELLED, JobScope};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn cancelled_slow_editor_preparation_removes_partial_file_and_never_opens_editor() {
+        crate::tasks::runtime().block_on(async {
+            let local =
+                std::env::temp_dir().join(format!("helix-editor-cancel-{}", std::process::id()));
+            let _ = std::fs::remove_file(&local);
+            let (mut source, reader) = tokio::io::duplex(32);
+            let scope = JobScope::default();
+            let running = scope.clone();
+            let destination = local.clone();
+            let opened = Arc::new(AtomicBool::new(false));
+            let launched = opened.clone();
+            let job = tokio::spawn(async move {
+                let (_, mut pending) = running.run(copy_to_temporary(reader, &destination)).await?;
+                running.start(|| {
+                    launched.store(true, Ordering::SeqCst);
+                    pending.keep = true;
+                    Ok::<_, String>(())
+                })
+            });
+            source.write_all(b"partial download").await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if std::fs::metadata(&local).is_ok_and(|m| m.len() > 0) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // The source deliberately remains open: completion cannot win the race.
+            scope.cancel();
+            assert_eq!(job.await.unwrap().unwrap_err(), CANCELLED);
+            assert!(!opened.load(Ordering::SeqCst));
+            assert!(
+                !local.exists(),
+                "cancelled editor download left a partial file"
+            );
+        });
     }
 }

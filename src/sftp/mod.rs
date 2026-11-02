@@ -9,6 +9,7 @@ use std::{pin::Pin, sync::Arc};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 pub mod browser;
 pub mod editor;
+pub mod jobs;
 pub mod tmux;
 #[derive(Clone)]
 pub enum Endpoint {

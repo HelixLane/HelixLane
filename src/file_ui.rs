@@ -19,6 +19,7 @@ use helixlane::{
         Endpoint, Kind,
         browser::{Browser, Sort},
         editor::{EditLease, EditorManager},
+        jobs::{JobScope, delete_tree},
     },
     tasks::{self, Conflict, JobState, TransferManager, TransferSpec},
     workspace::ConnectionProfile,
@@ -158,6 +159,7 @@ fn file_views() -> &'static Mutex<std::collections::BTreeMap<u64, std::sync::Wea
     VIEWS.get_or_init(|| Mutex::new(Default::default()))
 }
 pub struct FilePane {
+    jobs: JobScope,
     polling: Option<Task<()>>,
     window_handle: Option<AnyWindowHandle>,
     local_scroll: ScrollHandle,
@@ -235,6 +237,7 @@ impl FilePane {
         ];
 
         let mut this = Self {
+            jobs: JobScope::default(),
             polling: None,
             window_handle: None,
             local_scroll: ScrollHandle::new(),
@@ -357,6 +360,7 @@ impl FilePane {
         }
     }
     pub fn cancel_owned_jobs(&mut self, cx: &mut Context<Self>) {
+        self.jobs.cancel();
         self.auth.update(cx, |a, _| a.cancel_owned_jobs());
     }
     pub fn rebind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -779,50 +783,62 @@ impl FilePane {
             ..
         } = captured;
         let op = op.to_string();
+        let jobs = self.jobs.clone();
         tasks::runtime().spawn(async move {
-            let result = async {
-                match op.as_str() {
-                    "mkdir" => {
-                        if value.is_empty() || value.contains('/') || value == "." || value == ".."
-                        {
-                            return Err("Invalid directory name".into());
+            let result = jobs
+                .run(async {
+                    match op.as_str() {
+                        "mkdir" => {
+                            if value.is_empty()
+                                || value.contains('/')
+                                || value == "."
+                                || value == ".."
+                            {
+                                return Err("Invalid directory name".into());
+                            }
+                            jobs.check()?;
+                            endpoint
+                                .mkdir(&endpoint.checked_child_path(&path, &value)?)
+                                .await?
                         }
-                        endpoint
-                            .mkdir(&endpoint.checked_child_path(&path, &value)?)
-                            .await?
+                        "rename" => {
+                            if selected.len() != 1
+                                || value.is_empty()
+                                || value.contains('/')
+                                || value == "."
+                                || value == ".."
+                            {
+                                return Err("Select one entry and enter a valid name".into());
+                            }
+                            let to = endpoint.checked_child_path(&path, &value)?;
+                            if endpoint.stat(&to).await?.is_some() {
+                                return Err("Target exists".into());
+                            }
+                            jobs.check()?;
+                            endpoint.rename(&selected[0], &to).await?
+                        }
+                        "chmod" => {
+                            let mode = u32::from_str_radix(value.trim(), 8)
+                                .map_err(|_| "Enter octal permissions, e.g. 644".to_string())?;
+                            jobs.for_each(selected, |p| {
+                                let endpoint = endpoint.clone();
+                                async move { endpoint.chmod(&p, mode).await }
+                            })
+                            .await?;
+                        }
+                        "delete" => {
+                            jobs.for_each(selected, |p| {
+                                let endpoint = endpoint.clone();
+                                let scope = jobs.clone();
+                                async move { delete_tree(&endpoint, &p, &scope).await }
+                            })
+                            .await?;
+                        }
+                        _ => {}
                     }
-                    "rename" => {
-                        if selected.len() != 1
-                            || value.is_empty()
-                            || value.contains('/')
-                            || value == "."
-                            || value == ".."
-                        {
-                            return Err("Select one entry and enter a valid name".into());
-                        }
-                        let to = endpoint.checked_child_path(&path, &value)?;
-                        if endpoint.stat(&to).await?.is_some() {
-                            return Err("Target exists".into());
-                        }
-                        endpoint.rename(&selected[0], &to).await?
-                    }
-                    "chmod" => {
-                        let mode = u32::from_str_radix(value.trim(), 8)
-                            .map_err(|_| "Enter octal permissions, e.g. 644".to_string())?;
-                        for p in selected {
-                            endpoint.chmod(&p, mode).await?;
-                        }
-                    }
-                    "delete" => {
-                        for p in selected {
-                            delete_tree(&endpoint, &p).await?;
-                        }
-                    }
-                    _ => {}
-                }
-                Ok::<(), String>(())
-            }
-            .await;
+                    Ok::<(), String>(())
+                })
+                .await;
             let mut s = state.lock().unwrap();
             if s.generation != generation {
                 return;
@@ -832,7 +848,10 @@ impl FilePane {
                     s.notice = Some("Completed".into());
                     s.error = None;
                 }
-                Err(e) => s.error = Some(e),
+                Err(e) => {
+                    s.notice = None;
+                    s.error = Some(e);
+                }
             }
         });
     }
@@ -856,31 +875,39 @@ impl FilePane {
                 target.generation,
             )
         };
+        let jobs = self.jobs.clone();
         tasks::runtime().spawn(async move {
-            let result = async {
-                let lease = EditLease::download(
+            let result = jobs
+                .run(EditLease::download(
                     endpoint,
                     path,
                     &std::env::temp_dir().join("helixlane-edits"),
-                )
-                .await?;
-                lease.open(&program)?;
-                Ok::<_, String>(Arc::new(lease))
-            }
-            .await;
+                ))
+                .await
+                .and_then(|lease| {
+                    let lease = Arc::new(lease);
+                    let result = jobs.start(|| {
+                        lease.open(&program)?;
+                        EditorManager::global().register(lease.clone());
+                        Ok(())
+                    });
+                    if result.is_err() {
+                        let _ = std::fs::remove_file(&lease.local);
+                    }
+                    result
+                });
             let mut s = state.lock().unwrap();
             if s.generation != generation {
-                if let Ok(lease) = result {
-                    EditorManager::global().register(lease)
-                }
                 return;
             }
             match result {
-                Ok(lease) => {
-                    EditorManager::global().register(lease);
+                Ok(()) => {
                     s.notice = Some("External editor opened".into());
                 }
-                Err(e) => s.error = Some(e),
+                Err(e) => {
+                    s.notice = None;
+                    s.error = Some(e);
+                }
             }
         });
     }
@@ -1280,19 +1307,6 @@ impl Drop for FilePane {
             views.remove(&self.id);
         }
     }
-}
-fn delete_tree<'a>(
-    e: &'a Endpoint,
-    p: &'a str,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-    Box::pin(async move {
-        if e.stat(p).await?.is_some_and(|e| e.kind == Kind::Directory) {
-            for child in e.list(p).await? {
-                delete_tree(e, &child.path).await?
-            }
-        }
-        e.remove(p).await
-    })
 }
 impl Render for FilePane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2004,5 +2018,184 @@ mod windowless_binding_tests {
                 assert!(!state.busy);
             });
         });
+    }
+}
+
+#[cfg(all(test, feature = "shell-tests"))]
+mod scoped_file_jobs_tests {
+    use super::{FilePane, MutationTarget};
+    use gpui_kit as gpui;
+    use helixlane::{
+        settings::Settings,
+        sftp::Endpoint,
+        workspace::{TargetMode, ToolKind},
+    };
+    use std::{cell::RefCell, rc::Rc, time::Duration};
+
+    #[gpui::test]
+    fn scoped_file_job_survives_follow_retarget_hide_and_closed_presentation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_quit_mode(gpui::QuitMode::Explicit);
+        });
+        let root = std::env::temp_dir().join(format!("helix-file-continue-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let captured = root.join("captured-A");
+        let current = root.join("current-B");
+        std::fs::write(&captured, b"A").unwrap();
+        std::fs::write(&current, b"B").unwrap();
+        let mut settings = Settings::default();
+        let id = settings.workspace.open(ToolKind::Sftp, TargetMode::Follow);
+        let profile = settings.workspace.capture_task_target(id).unwrap().profile;
+        let settings = Rc::new(RefCell::new(settings));
+        let window = cx.add_window(|w, cx| FilePane::new(id, profile, settings.clone(), w, cx));
+        let pane = window.root(cx).unwrap();
+        let jobs = cx.update(|cx| pane.read(cx).jobs.clone());
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let target = captured.display().to_string();
+        let task = helixlane::tasks::runtime().spawn(async move {
+            jobs.run(async move {
+                gate.await.map_err(|e| e.to_string())?;
+                Endpoint::Local.remove(&target).await
+            })
+            .await
+        });
+        cx.update(|cx| {
+            settings.borrow_mut().workspace.activate_resource(2);
+            let next = settings
+                .borrow()
+                .workspace
+                .capture_task_target(id)
+                .unwrap()
+                .profile;
+            pane.update(cx, |p, cx| {
+                p.bind_background(next, cx);
+                p.set_visible(false);
+                assert!(p.jobs.check().is_ok());
+            });
+            // Continue removes the native presentation without invoking explicit cancel.
+            window.update(cx, |_, w, _| w.remove_window()).unwrap();
+        });
+        release.send(()).unwrap();
+        helixlane::tasks::runtime().block_on(task).unwrap().unwrap();
+        assert!(!captured.exists());
+        assert!(current.exists(), "submitted mutation was retargeted to B");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn scoped_file_cancel_reaches_mutations_and_leaves_other_view_jobs_alive(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_quit_mode(gpui::QuitMode::Explicit);
+        });
+        let root = std::env::temp_dir().join(format!("helix-file-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut settings = Settings::default();
+        let first = settings
+            .workspace
+            .open(ToolKind::Sftp, TargetMode::Fixed(1));
+        let second = settings
+            .workspace
+            .open(ToolKind::Sftp, TargetMode::Fixed(1));
+        let profile = settings
+            .workspace
+            .capture_task_target(first)
+            .unwrap()
+            .profile;
+        let settings = Rc::new(RefCell::new(settings));
+        let window =
+            cx.add_window(|w, cx| FilePane::new(first, profile.clone(), settings.clone(), w, cx));
+        let other = cx.add_window(|w, cx| FilePane::new(second, profile, settings, w, cx));
+        let pane = window.root(cx).unwrap();
+        let peer = other.root(cx).unwrap();
+        let protected = root.join("cancelled-view-file");
+        let independent = root.join("other-view-file");
+        std::fs::write(&protected, b"keep").unwrap();
+        std::fs::write(&independent, b"delete").unwrap();
+        let states = cx.update(|cx| {
+            for (pane, path, cancel) in [(&pane, &protected, true), (&peer, &independent, false)] {
+                pane.update(cx, |p, cx| {
+                    let mut state = p.state.lock().unwrap();
+                    state.pending = Some(MutationTarget {
+                        endpoint: Endpoint::Local,
+                        path: root.display().to_string(),
+                        selected: vec![path.display().to_string()],
+                        generation: state.generation,
+                        remote: false,
+                    });
+                    drop(state);
+                    if cancel {
+                        p.cancel_owned_jobs(cx);
+                    }
+                    p.operation("delete", String::new());
+                });
+            }
+            [pane.read(cx).state.clone(), peer.read(cx).state.clone()]
+        });
+        helixlane::tasks::runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while states.iter().any(|state| {
+                    let state = state.lock().unwrap();
+                    state.error.is_none() && state.notice.is_none()
+                }) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        assert!(
+            protected.exists(),
+            "cancelled FilePane still executed a detached mutation"
+        );
+        assert!(
+            !independent.exists(),
+            "another view's mutation must continue"
+        );
+        assert!(
+            states[0]
+                .lock()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Cancelled")
+        );
+        cx.update(|cx| {
+            pane.update(cx, |p, _| {
+                p.state.lock().unwrap().error = None;
+                p.edit("helixlane-editor-must-not-be-launched".into());
+            })
+        });
+        helixlane::tasks::runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while states[0].lock().unwrap().error.is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        assert_eq!(
+            states[0].lock().unwrap().error.as_deref(),
+            Some(helixlane::sftp::jobs::CANCELLED)
+        );
+        assert!(
+            helixlane::sftp::editor::EditorManager::global()
+                .leases()
+                .iter()
+                .all(|lease| lease.remote != protected.display().to_string())
+        );
+
+        cx.update(|cx| {
+            window.update(cx, |_, w, _| w.remove_window()).unwrap();
+            other.update(cx, |_, w, _| w.remove_window()).unwrap();
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

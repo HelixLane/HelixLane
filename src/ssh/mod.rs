@@ -21,7 +21,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 pub type SessionId = u64;
 const MAX_INPUT_BYTES: usize = 64 * 1024;
 const INPUT_QUEUE_CAPACITY: usize = 32;
@@ -59,6 +59,7 @@ pub struct Session {
     pub profile: ConnectionProfile,
     pub state: Mutex<SessionState>,
     commands: mpsc::Sender<Command>,
+    terminal_stop: watch::Sender<bool>,
     outbound: mpsc::Sender<Vec<u8>>,
     transport: Mutex<Option<Arc<client::Handle<Handler>>>>,
     socket: Mutex<Option<std::net::TcpStream>>,
@@ -72,7 +73,6 @@ pub struct Session {
     stop: Mutex<Option<oneshot::Sender<()>>>,
 }
 enum Command {
-    StopTerminal,
     Resize(u32, u32),
     Open(oneshot::Sender<Result<channel::ManagedChannel, String>>),
 }
@@ -172,6 +172,7 @@ impl Service {
                 authentication: None,
             }),
             commands,
+            terminal_stop: watch::channel(false).0,
             outbound,
             transport: Mutex::new(None),
             socket: Mutex::new(None),
@@ -280,7 +281,9 @@ impl Session {
     }
     /// Close only this presentation's PTY; shared SFTP/exec/forward channels stay alive.
     pub fn stop_terminal(&self) {
-        let _ = self.commands.try_send(Command::StopTerminal);
+        // Retained independently of ordinary resize/channel-open queue capacity.
+        // send_replace also retains a request made before connected() subscribes.
+        self.terminal_stop.send_replace(true);
     }
     pub fn disconnect(&self) {
         // Disconnect is explicitly transport-level, including reused PTYs.
@@ -523,6 +526,12 @@ async fn connected(
     terminal: bool,
 ) -> Result<(), String> {
     *session.transport.lock().unwrap() = Some(ssh.clone());
+    let mut terminal_stop = session.terminal_stop.subscribe();
+    let mut terminal_cancelled = *terminal_stop.borrow();
+    if terminal && terminal_cancelled {
+        session.terminal_finished(None);
+    }
+    let terminal = terminal && !terminal_cancelled;
     let mut terminal_permit = if terminal {
         Some(session.capacity.acquire(session.profile.transport_policy)?)
     } else {
@@ -574,17 +583,31 @@ async fn connected(
             break;
         }
         tokio::select! {
+            biased;
+            _ = async { let _ = terminal_stop.wait_for(|stopped| *stopped).await; }, if !terminal_cancelled => {
+                terminal_cancelled = true;
+                // Release only this PTY; TerminalLease closes it independently.
+                // Shared transports, channel-open work and forwards remain alive.
+                reader=None;writer=None;writing=None;terminal_lease.take();session.terminal_finished(None);
+            },
             result=async {writing.as_mut().expect("writer guarded by select").await},if writing.is_some()=>{
                 writing=None;writer=None;session.terminal_finished(result.err());
             },
             _=openings.join_next(),if !openings.is_empty()=>{},
             _ = tokio::time::sleep(Duration::from_secs(1)), if reader.is_none() => {if ssh.is_closed() {break;}}
             command = commands.recv() => match command {
-                Some(Command::StopTerminal) => {
-                    if let Some(writer)=&writer {let _=writer.close().await;}
-                    reader=None;writer=None;writing=None;terminal_lease.take();session.terminal_finished(None);
+                Some(Command::Resize(cols,rows)) => {
+                    session.state.lock().unwrap().terminal.resize(cols as usize,rows as usize);
+                    if let Some(writer)=&writer {
+                        tokio::select! {
+                            biased;
+                            _ = terminal_stop.wait_for(|stopped| *stopped) => {},
+                            result = writer.window_change(cols,rows,0,0) => {
+                                if result.is_err() {session.terminal_finished(Some("Terminal resize failed".into()));}
+                            }
+                        }
+                    }
                 }
-                Some(Command::Resize(cols,rows)) => { session.state.lock().unwrap().terminal.resize(cols as usize,rows as usize); if let Some(writer)=&writer && writer.window_change(cols,rows,0,0).await.is_err() {session.terminal_finished(Some("Terminal resize failed".into()));} }
                 Some(Command::Open(reply)) => {
                     let permit = match session.capacity.acquire(session.profile.transport_policy) {Ok(permit)=>permit,Err(error)=>{let _=reply.send(Err(error));continue;}};
                     let ssh=ssh.clone();

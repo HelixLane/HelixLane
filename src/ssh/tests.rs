@@ -7,6 +7,7 @@ use russh::{
 #[derive(Clone)]
 struct Fixture {
     shell: bool,
+    closed: Option<Arc<AtomicU64>>,
 }
 impl server::Server for Fixture {
     type Handler = Self;
@@ -65,6 +66,16 @@ impl server::Handler for Fixture {
         }
         s.channel_success(id)?;
         s.data(id, b"\x1b[32mwire-ready\x1b[0m\r\n".as_slice())?;
+        Ok(())
+    }
+    async fn channel_close(
+        &mut self,
+        _: ChannelId,
+        _: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
+        if let Some(closed) = &self.closed {
+            closed.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
     async fn data(
@@ -137,10 +148,13 @@ fn wire_session_requires_trust_then_streams_and_never_changes_target() {
             ..Default::default()
         });
         let server = tokio::spawn(async move {
-            Fixture { shell: true }
-                .run_on_socket(config, &listener)
-                .await
-                .unwrap()
+            Fixture {
+                shell: true,
+                closed: None,
+            }
+            .run_on_socket(config, &listener)
+            .await
+            .unwrap()
         });
         let session = service.connect(profile(port), Secret::new("correct".into()), false);
         wait(&session, |s| matches!(s.status, Status::HostKey { .. })).await;
@@ -183,10 +197,13 @@ fn sftp_only_transport_opens_channels_without_requesting_a_pty() {
             ..Default::default()
         });
         let server = tokio::spawn(async move {
-            Fixture { shell: false }
-                .run_on_socket(config, &listener)
-                .await
-                .unwrap()
+            Fixture {
+                shell: false,
+                closed: None,
+            }
+            .run_on_socket(config, &listener)
+            .await
+            .unwrap()
         });
         let session =
             service.connect_transport(profile(port), Secret::new("correct".into()), false);
@@ -230,10 +247,13 @@ fn changed_key_rejection_and_authentication_errors_fail_closed() {
             ..Default::default()
         });
         let server = tokio::spawn(async move {
-            Fixture { shell: true }
-                .run_on_socket(config, &listener)
-                .await
-                .unwrap()
+            Fixture {
+                shell: true,
+                closed: None,
+            }
+            .run_on_socket(config, &listener)
+            .await
+            .unwrap()
         });
         let mut keys = HostKeys::default();
         keys.trust("127.0.0.1", port, "old-key".into());
@@ -416,10 +436,13 @@ fn single_channel_rejects_exec_while_pty_remains_usable() {
             ..Default::default()
         });
         let server = tokio::spawn(async move {
-            Fixture { shell: true }
-                .run_on_socket(config, &listener)
-                .await
-                .unwrap()
+            Fixture {
+                shell: true,
+                closed: None,
+            }
+            .run_on_socket(config, &listener)
+            .await
+            .unwrap()
         });
         let mut p = profile(port);
         p.transport_policy = crate::workspace::TransportPolicy::SingleChannel;
@@ -433,6 +456,96 @@ fn single_channel_rejects_exec_while_pty_remains_usable() {
         );
         session.input(b"still-usable".to_vec());
         wait(&session, |s| s.terminal.text().contains("still-usable")).await;
+        session.disconnect();
+        server.abort();
+    });
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn terminal_cancel_survives_full_command_queue_and_preserves_shared_channels() {
+    let path =
+        std::env::temp_dir().join(format!("helix-terminal-cancel-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let service = Service::new(path.clone());
+    service.runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = Arc::new(server::Config {
+            keys: vec![fixture_key()],
+            ..Default::default()
+        });
+        let closed = Arc::new(AtomicU64::new(0));
+        let server_closed = closed.clone();
+        let server = tokio::spawn(async move {
+            Fixture {
+                shell: true,
+                closed: Some(server_closed),
+            }
+            .run_on_socket(config, &listener)
+            .await
+            .unwrap()
+        });
+        let session = service.connect(profile(port), Secret::new("correct".into()), false);
+        wait(&session, |s| matches!(s.status, Status::HostKey { .. })).await;
+        session.trust(true);
+        wait(&session, |s| {
+            s.status == Status::Connected && s.terminal_status == TerminalStatus::Running
+        })
+        .await;
+        let mut peer = session.open_channel().await.unwrap();
+        // Reserve every ordinary command slot so the full condition is stable
+        // even while the independent SSH event loop runs on another thread.
+        let saturated = session.commands.reserve_many(32).await.unwrap();
+        assert_eq!(session.commands.capacity(), 0);
+        assert!(matches!(
+            session.commands.try_send(Command::Resize(80, 24)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        session.stop_terminal();
+        wait(&session, |s| s.terminal_status == TerminalStatus::Finished).await;
+        assert_eq!(session.state.lock().unwrap().status, Status::Connected);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while closed.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("PTY close never reached the remote peer");
+        peer.exec(true, b"existing-channel-survived".as_slice())
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        while let Some(message) = peer.wait().await {
+            if let ChannelMsg::Data { data } = message {
+                bytes.extend_from_slice(&data);
+            }
+        }
+        assert_eq!(bytes, b"existing-channel-survived");
+        drop(saturated);
+        let output = service
+            .exec(session.clone(), b"new-channel-after-stop".to_vec())
+            .result
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.bytes, b"new-channel-after-stop");
+        // A Session owns one PTY. An explicit new terminal gets a fresh owner
+        // and stop signal while reusing the still-connected shared transport.
+        let renewed = service.connect(profile(port), Secret::new(String::new()), false);
+        assert_ne!(renewed.id, session.id);
+        wait(&renewed, |s| s.terminal_status == TerminalStatus::Running).await;
+        assert!(Arc::ptr_eq(renewed.owner.as_ref().unwrap(), &session));
+        session.stop_terminal(); // repeated cancellation cannot poison the new PTY
+        renewed.input(b"fresh-pty-still-usable".to_vec());
+        wait(&renewed, |s| {
+            s.terminal.text().contains("fresh-pty-still-usable")
+        })
+        .await;
+        assert_eq!(
+            session.state.lock().unwrap().terminal_status,
+            TerminalStatus::Finished
+        );
         session.disconnect();
         server.abort();
     });
