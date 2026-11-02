@@ -99,10 +99,12 @@ pub(super) fn profile(port: u16) -> ConnectionProfile {
         username: "tester".into(),
         credential_ref: None,
         jump_resource: None,
+        route: None,
+        transport_policy: Default::default(),
         auth: AuthMethod::Password,
     }
 }
-async fn wait(session: &Session, predicate: impl Fn(&SessionState) -> bool) {
+pub(super) async fn wait(session: &Session, predicate: impl Fn(&SessionState) -> bool) {
     tokio::time::timeout(std::time::Duration::from_secs(8), async {
         loop {
             if predicate(&session.state.lock().unwrap()) {
@@ -396,6 +398,42 @@ fn rsa_private_key_load_and_sha2_authentication_survive_shell_dependency_alignme
         ));
         session.disconnect();
         wait(&session, |state| state.status == Status::Disconnected).await;
+        server.abort();
+    });
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn single_channel_rejects_exec_while_pty_remains_usable() {
+    let path = std::env::temp_dir().join(format!("helix-single-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let service = Service::new(path.clone());
+    service.runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = Arc::new(server::Config {
+            keys: vec![fixture_key()],
+            ..Default::default()
+        });
+        let server = tokio::spawn(async move {
+            Fixture { shell: true }
+                .run_on_socket(config, &listener)
+                .await
+                .unwrap()
+        });
+        let mut p = profile(port);
+        p.transport_policy = crate::workspace::TransportPolicy::SingleChannel;
+        let session = service.connect(p, Secret::new("correct".into()), false);
+        wait(&session, |s| matches!(s.status, Status::HostKey { .. })).await;
+        session.trust(true);
+        wait(&session, |s| s.status == Status::Connected).await;
+        assert!(
+            session.open_channel().await.is_err(),
+            "extra exec/SFTP bypassed single channel policy"
+        );
+        session.input(b"still-usable".to_vec());
+        wait(&session, |s| s.terminal.text().contains("still-usable")).await;
+        session.disconnect();
         server.abort();
     });
     let _ = std::fs::remove_file(path);

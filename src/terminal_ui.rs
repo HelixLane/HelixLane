@@ -34,6 +34,13 @@ pub struct TerminalPane {
     key_path: Entity<InputState>,
     search: Entity<InputState>,
     remember: bool,
+    auth_fields: Vec<Entity<InputState>>,
+    shown_prompt: Option<helixlane::ssh::auth::AuthPrompt>,
+    forward_bind: Entity<InputState>,
+    forward_host: Entity<InputState>,
+    forward_port: Entity<InputState>,
+    forward_mode: u8,
+    show_network: bool,
     focus: FocusHandle,
     bounds: Rc<RefCell<Bounds<Pixels>>>,
     selecting: Option<(usize, usize)>,
@@ -111,6 +118,25 @@ impl TerminalPane {
             }),
             search,
             remember: false,
+            auth_fields: Vec::new(),
+            shown_prompt: None,
+            forward_bind: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value("127.0.0.1:0")
+                    .placeholder("Bind IP:port / 监听地址")
+            }),
+            forward_host: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value("127.0.0.1")
+                    .placeholder("Destination host / 目标主机")
+            }),
+            forward_port: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value("80")
+                    .placeholder("Destination port / 目标端口")
+            }),
+            forward_mode: 0,
+            show_network: false,
             focus: cx.focus_handle(),
             bounds: Default::default(),
             selecting: None,
@@ -191,6 +217,8 @@ impl TerminalPane {
                     .find(|p| p.id == self.profile.id)
                 {
                     *p = self.profile.clone();
+                    p.route = None;
+                    p.route = None;
                 }
             }
             return;
@@ -203,6 +231,7 @@ impl TerminalPane {
                 .find(|p| p.id == self.profile.id)
             {
                 *p = self.profile.clone();
+                p.route = None;
             }
         }
         if let Err(error) = settings.save(&Settings::path()) {
@@ -229,7 +258,10 @@ impl TerminalPane {
                 || self.profile.credential_ref.is_some()
                 || matches!(
                     self.profile.auth,
-                    AuthMethod::None | AuthMethod::PrivateKey { .. }
+                    AuthMethod::None
+                        | AuthMethod::PrivateKey { .. }
+                        | AuthMethod::Agent
+                        | AuthMethod::KeyboardInteractive
                 ));
         if ready {
             self.connect(window, cx);
@@ -257,6 +289,8 @@ impl TerminalPane {
         if self.remember {
             self.profile.credential_ref = Some(format!("profile-{}", self.profile.id));
         }
+        self.profile
+            .capture_route(&self.settings.borrow().workspace.resources);
         self.persist_profile();
         self.bound_profile = self.profile.clone();
         let secret = self
@@ -371,7 +405,7 @@ impl Focusable for TerminalPane {
     }
 }
 impl Render for TerminalPane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::current(cx);
         let language = self.settings.borrow().language;
         let status = self
@@ -483,7 +517,14 @@ impl Render for TerminalPane {
                 }),
         );
         if self.session.is_none() {
-            for session in Service::global().resumable(&self.profile) {
+            for session in Service::global()
+                .resumable(&self.profile)
+                .into_iter()
+                .filter(|s| {
+                    self.transport_only
+                        || s.state.lock().unwrap().terminal_status != TerminalStatus::NotRequested
+                })
+            {
                 let label = format!("{} #{}", text("Resume session", "恢复会话"), session.id);
                 content = content.child(
                     Button::new(("resume", session.id))
@@ -544,11 +585,34 @@ impl Render for TerminalPane {
                         cx.notify();
                     },
                 )));
+            auth = auth
+                .child(
+                    action("agent", text("SSH agent", "SSH Agent")).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.profile.auth = AuthMethod::Agent;
+                            this.remember = false;
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    action("interactive", text("Interactive", "交互式")).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.profile.auth = AuthMethod::KeyboardInteractive;
+                            this.remember = false;
+                            cx.notify();
+                        },
+                    )),
+                );
             auth = auth.child(div().text_size(px(11.)).text_color(rgb(p.accent)).child(
                 match self.profile.auth {
                     AuthMethod::Password => text("Password selected", "已选密码"),
                     AuthMethod::PrivateKey { .. } => text("Private key selected", "已选私钥"),
                     AuthMethod::None => text("No authentication selected", "已选无认证"),
+                    AuthMethod::Agent => text("SSH agent selected", "已选 SSH Agent"),
+                    AuthMethod::KeyboardInteractive => {
+                        text("Interactive selected", "已选交互式认证")
+                    }
                 },
             ));
             content = content.child(auth);
@@ -568,7 +632,10 @@ impl Render for TerminalPane {
                         .child(Input::new(&self.key_path).small()),
                 );
             }
-            if !matches!(self.profile.auth, AuthMethod::None) {
+            if matches!(
+                self.profile.auth,
+                AuthMethod::Password | AuthMethod::PrivateKey { .. }
+            ) {
                 content = content.child(
                     row()
                         .px_3()
@@ -602,11 +669,266 @@ impl Render for TerminalPane {
             let changed = previous.is_some();
             content=content.child(div().m_3().p_3().border_1().border_color(rgb(p.warning)).rounded(px(6.)).flex().flex_col().gap_2()
                 .child(div().text_color(rgb(p.warning)).child(if changed {text("WARNING: HOST KEY CHANGED","警告：主机密钥已更改")} else {text("Verify this host before connecting","连接前请验证主机身份")}))
-                .child(format!("{}:{}",self.profile.host,self.profile.port))
+                .child(self.session.as_ref().and_then(|s|s.state.lock().unwrap().hop.clone()).map(|h|h.label()).unwrap_or_else(||format!("{}:{}",self.profile.host,self.profile.port)))
                 .children(previous.map(|old|div().text_size(px(11.)).child(format!("{}: {old}",text("Previous","原指纹")))))
                 .child(div().text_size(px(11.)).child(format!("{}: {fingerprint}",text("Presented","新指纹"))))
                 .child(div().text_size(px(11.)).child(text("Compare this SHA256 fingerprint with a trusted source. Accepting stores this host identity.","请通过可信渠道核对 SHA256 指纹。接受后将保存此主机身份。")))
                 .child(row().gap_2().child(action("reject",text("Reject","拒绝")).on_click(cx.listener(|this,_,_,_|{if let Some(s)=&this.session {s.trust(false);}}))).child(action("trust",if changed {text("Replace trusted key","替换受信任密钥")} else {text("Trust and connect","信任并连接")}).on_click(cx.listener(|this,_,_,_|{if let Some(s)=&this.session {s.trust(true);}})))));
+        }
+        let prompt = self
+            .session
+            .as_ref()
+            .and_then(|s| s.state.lock().unwrap().authentication.clone());
+        if self.shown_prompt != prompt {
+            self.auth_fields = prompt
+                .as_ref()
+                .map(|p| {
+                    p.prompts
+                        .iter()
+                        .map(|(label, echo)| {
+                            cx.new(|cx| {
+                                InputState::new(window, cx)
+                                    .masked(!echo)
+                                    .placeholder(label.clone())
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.shown_prompt = prompt.clone();
+        }
+        if let Some(prompt) = prompt {
+            let mut form = div()
+                .m_3()
+                .p_3()
+                .border_1()
+                .border_color(rgb(p.warning))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(prompt.hop.label())
+                .child(prompt.instructions);
+            for (field, (label, _)) in self.auth_fields.iter().zip(prompt.prompts.iter()) {
+                form = form
+                    .child(div().text_size(px(11.)).child(label.clone()))
+                    .child(Input::new(field).small());
+            }
+            content = content.child(form.child(
+                action("answer-auth", text("Submit response", "提交认证")).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        let answers = this
+                            .auth_fields
+                            .iter()
+                            .map(|field| Secret::new(field.read(cx).value().to_string()))
+                            .collect();
+                        if let Some(session) = &this.session {
+                            session.answer_auth(answers);
+                        }
+                        for field in &this.auth_fields {
+                            field.update(cx, |s, cx| s.set_value("", window, cx));
+                        }
+                        cx.notify();
+                    },
+                )),
+            ));
+        }
+        content = content.child(
+            action(
+                "network-config",
+                if self.show_network {
+                    text("Hide SSH networking", "收起 SSH 网络配置")
+                } else {
+                    text(
+                        "SSH networking / jump hosts / forwarding",
+                        "SSH 网络 / 跳板 / 转发",
+                    )
+                },
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.show_network = !this.show_network;
+                cx.notify();
+            })),
+        );
+        if self.show_network {
+            use helixlane::workspace::TransportPolicy;
+            let policy = self.profile.transport_policy;
+            let mut network = div().px_3().py_2().flex().flex_col().gap_2().child(
+                div().text_size(px(11.)).child(text(
+                    "Transport policy (applies on Connect)",
+                    "传输策略（下次连接生效）",
+                )),
+            );
+            let mut policies = row().gap_2().flex_wrap();
+            for (id, label, value) in [
+                (
+                    "shared",
+                    text("Shared channels", "共享通道"),
+                    TransportPolicy::Shared,
+                ),
+                (
+                    "independent",
+                    text("Independent connection", "独立连接"),
+                    TransportPolicy::Independent,
+                ),
+                (
+                    "single",
+                    text("Single channel", "单通道"),
+                    TransportPolicy::SingleChannel,
+                ),
+            ] {
+                policies = policies.child(
+                    action(
+                        id,
+                        format!("{}{}", if policy == value { "✓ " } else { "" }, label),
+                    )
+                    .disabled(busy || connected)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.profile.transport_policy = value;
+                        cx.notify();
+                    })),
+                );
+            }
+            network=network.child(policies).child(div().text_size(px(11.)).child(text("Single-channel hosts refuse extra channels. Close the occupied channel or explicitly connect with Independent policy.","单通道主机拒绝额外通道。请关闭占用通道，或明确选择独立连接。")));
+            if !busy && !connected {
+                let mut jumps = row().gap_2().flex_wrap().child(
+                    action("no-jump", text("Direct / no jump", "直连 / 无跳板")).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.profile.jump_resource = None;
+                            cx.notify();
+                        }),
+                    ),
+                );
+                for resource in self
+                    .settings
+                    .borrow()
+                    .workspace
+                    .resources
+                    .iter()
+                    .filter(|r| !r.profiles.iter().any(|p| p.id == self.profile.id))
+                {
+                    let id = resource.id;
+                    let label = format!(
+                        "{}{} #{}",
+                        if self.profile.jump_resource == Some(id) {
+                            "✓ "
+                        } else {
+                            ""
+                        },
+                        resource.name,
+                        id
+                    );
+                    jumps = jumps.child(
+                        Button::new(("jump", id))
+                            .ghost()
+                            .small()
+                            .label(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.profile.jump_resource = Some(id);
+                                cx.notify();
+                            })),
+                    );
+                }
+                network = network
+                    .child(div().text_size(px(11.)).child(text(
+                        "Jump resource (its own jump chain is included)",
+                        "跳板资源（包含其自身跳板链）",
+                    )))
+                    .child(jumps);
+            }
+            if let Some(session) = &self.session {
+                let route = session
+                    .profile
+                    .route_profiles()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|p| format!("{}@{}:{}", p.username, p.host, p.port))
+                    .collect::<Vec<_>>()
+                    .join(" → ");
+                network = network.child(div().text_size(px(11.)).child(route));
+                if connected {
+                    let labels = [
+                        text("Local forward", "本地转发"),
+                        text("Remote forward", "远程转发"),
+                        text("SOCKS5 CONNECT", "SOCKS5 CONNECT"),
+                    ];
+                    network = network
+                        .child(
+                            action("forward-mode", labels[self.forward_mode as usize]).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.forward_mode = (this.forward_mode + 1) % 3;
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(Input::new(&self.forward_bind).small());
+                    if self.forward_mode != 2 {
+                        network = network.child(
+                            row()
+                                .gap_2()
+                                .child(Input::new(&self.forward_host).small())
+                                .child(Input::new(&self.forward_port).small()),
+                        );
+                    }
+                    network = network.child(
+                        action("start-forward", text("Start forwarding", "启动转发")).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                use helixlane::ssh::forward::{Destination, ForwardSpec};
+                                if let Some(session) = &this.session {
+                                    let bind = this.forward_bind.read(cx).value().parse();
+                                    let port = this.forward_port.read(cx).value().parse::<u16>();
+                                    match (bind, port) {
+                                        (Ok(bind), Ok(port)) => {
+                                            let target = Destination {
+                                                host: this
+                                                    .forward_host
+                                                    .read(cx)
+                                                    .value()
+                                                    .to_string(),
+                                                port,
+                                            };
+                                            let spec = match this.forward_mode {
+                                                0 => ForwardSpec::Local { bind, target },
+                                                1 => ForwardSpec::Remote { bind, target },
+                                                _ => ForwardSpec::Socks { bind },
+                                            };
+                                            Service::global().forward(session.clone(), spec);
+                                        }
+                                        _ => {
+                                            let mut state = session.state.lock().unwrap();
+                                            state.input_notice = Some(
+                                                "Invalid forwarding address / 转发地址无效".into(),
+                                            );
+                                            state.revision += 1;
+                                        }
+                                    }
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    );
+                }
+                for job in session.forwards() {
+                    let status = format!(
+                        "#{} {:?} · {:?}",
+                        job.id,
+                        job.spec,
+                        job.status.lock().unwrap()
+                    );
+                    network = network.child(
+                        row()
+                            .gap_2()
+                            .child(div().flex_1().text_size(px(11.)).child(status))
+                            .child(
+                                Button::new(("stop-forward", job.id))
+                                    .ghost()
+                                    .small()
+                                    .label(text("Stop", "停止"))
+                                    .on_click(move |_, _, _| job.stop()),
+                            ),
+                    );
+                }
+            }
+            content = content.child(network);
         }
         if self.transport_only {
             return content.into_any_element();

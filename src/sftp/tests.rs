@@ -46,6 +46,8 @@ fn openssh_backend_operations_atomic_upload_external_conflict_and_sftp_only_tran
             auth: AuthMethod::None,
             credential_ref: None,
             jump_resource: None,
+            route: None,
+            transport_policy: Default::default(),
         };
         let session = service.connect_transport(profile.clone(), Secret::new(String::new()), false);
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -238,6 +240,8 @@ fn openssh_two_host_copy_uses_local_staging_and_cancellation_preserves_remote_or
                 auth: AuthMethod::None,
                 credential_ref: None,
                 jump_resource: None,
+                route: None,
+                transport_policy: Default::default(),
             };
             let session = service.connect_transport(profile, Secret::new(String::new()), false);
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -369,6 +373,8 @@ fn openssh_regular_file_never_replaces_nonempty_directory() {
                 auth: AuthMethod::None,
                 credential_ref: None,
                 jump_resource: None,
+                route: None,
+                transport_policy: Default::default(),
             },
             Secret::new(String::new()),
             false,

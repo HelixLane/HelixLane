@@ -156,7 +156,16 @@ pub enum AuthMethod {
     PrivateKey {
         path: String,
     },
+    Agent,
+    KeyboardInteractive,
     None,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TransportPolicy {
+    #[default]
+    Shared,
+    Independent,
+    SingleChannel,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectionProfile {
@@ -170,6 +179,10 @@ pub struct ConnectionProfile {
     #[serde(default)]
     pub auth: AuthMethod,
     pub jump_resource: Option<ResourceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<crate::ssh::route::RouteSnapshot>,
+    #[serde(default)]
+    pub transport_policy: TransportPolicy,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Resource {
@@ -351,6 +364,8 @@ impl Default for Workspace {
                         credential_ref: None,
                         auth: AuthMethod::default(),
                         jump_resource: None,
+                        route: None,
+                        transport_policy: Default::default(),
                     }],
                 })
                 .collect(),
@@ -418,9 +433,11 @@ impl Workspace {
     pub fn capture_task_target(&self, id: ViewId) -> Option<TaskTarget> {
         let resource_id = self.target(id)?;
         let r = self.resources.iter().find(|r| r.id == resource_id)?;
+        let mut profile = r.profiles.first()?.clone();
+        profile.capture_route(&self.resources);
         Some(TaskTarget {
             resource_id,
-            profile: r.profiles.first()?.clone(),
+            profile,
         })
     }
     /// Visibility changes affect collection only; session/task ownership lives elsewhere.
@@ -503,9 +520,34 @@ impl Workspace {
                 credential_ref: None,
                 auth: AuthMethod::default(),
                 jump_resource: None,
+                route: None,
+                transport_policy: Default::default(),
             }],
         });
         self.active_resource = Some(id);
         id
+    }
+}
+
+#[cfg(test)]
+mod advanced_route_tests {
+    use super::*;
+    #[test]
+    fn captured_target_contains_immutable_jump_profiles() {
+        let mut w = Workspace::default();
+        let destination = w.resources[0].id;
+        let jump = w.add_resource();
+        w.resources.last_mut().unwrap().profiles[0].host = "jump-a".into();
+        w.resources[0].profiles[0].jump_resource = Some(jump);
+        w.active_resource = Some(destination);
+        let view = w.views[0].id;
+        let captured = w.capture_task_target(view).unwrap();
+        w.resources.last_mut().unwrap().profiles[0].host = "mutated".into();
+        let snapshot = serde_json::to_string(&captured.profile).unwrap();
+        assert!(
+            snapshot.contains("jump-a"),
+            "captured task lost its jump endpoint: {snapshot}"
+        );
+        assert!(!snapshot.contains("mutated"));
     }
 }

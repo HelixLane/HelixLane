@@ -1,5 +1,9 @@
+pub mod auth;
+mod channel;
 pub mod credentials;
+pub mod forward;
 pub mod host_keys;
+pub mod route;
 use crate::workspace::AuthMethod;
 use crate::{terminal::Terminal, workspace::ConnectionProfile};
 use credentials::Secret;
@@ -47,6 +51,8 @@ pub struct SessionState {
     pub exit_status: Option<u32>,
     pub remote_eof: bool,
     pub terminal_status: TerminalStatus,
+    pub hop: Option<auth::HopIdentity>,
+    pub authentication: Option<auth::AuthPrompt>,
 }
 pub struct Session {
     pub id: SessionId,
@@ -57,11 +63,17 @@ pub struct Session {
     transport: Mutex<Option<Arc<client::Handle<Handler>>>>,
     socket: Mutex<Option<std::net::TcpStream>>,
     trust: Mutex<Option<oneshot::Sender<bool>>>,
+    auth_reply: Mutex<Option<oneshot::Sender<Vec<Secret>>>>,
+    capacity: Arc<channel::Capacity>,
+    hops: Mutex<Vec<Arc<client::Handle<Handler>>>>,
+    forwards: Mutex<HashMap<u64, Arc<forward::ForwardJob>>>,
+    remote_forwards: forward::RemoteRegistry,
+    owner: Option<Arc<Session>>,
     stop: Mutex<Option<oneshot::Sender<()>>>,
 }
 enum Command {
     Resize(u32, u32),
-    Open(oneshot::Sender<Result<russh::Channel<russh::client::Msg>, String>>),
+    Open(oneshot::Sender<Result<channel::ManagedChannel, String>>),
 }
 pub struct Service {
     runtime: tokio::runtime::Runtime,
@@ -97,6 +109,7 @@ impl Service {
             .filter(|session| {
                 session.profile == *profile
                     && session.state.lock().unwrap().status == Status::Connected
+                    && session.stop.lock().unwrap().is_some()
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -126,6 +139,20 @@ impl Service {
         remember: bool,
         terminal: bool,
     ) -> Arc<Session> {
+        let owner = if profile.transport_policy != crate::workspace::TransportPolicy::Independent {
+            self.resumable(&profile).into_iter().find(|s| {
+                s.transport
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|ssh| !ssh.is_closed())
+            })
+        } else {
+            None
+        };
+        if !terminal && let Some(owner) = &owner {
+            return owner.clone();
+        }
         let (commands, receiver) = mpsc::channel(32);
         let (outbound, outgoing) = mpsc::channel(INPUT_QUEUE_CAPACITY);
         let (stop, stopped) = oneshot::channel();
@@ -140,12 +167,26 @@ impl Service {
                 exit_status: None,
                 remote_eof: false,
                 terminal_status: TerminalStatus::NotRequested,
+                hop: None,
+                authentication: None,
             }),
             commands,
             outbound,
             transport: Mutex::new(None),
             socket: Mutex::new(None),
             trust: Mutex::new(None),
+            auth_reply: Mutex::new(None),
+            capacity: owner
+                .as_ref()
+                .map(|s| s.capacity.clone())
+                .unwrap_or_default(),
+            hops: Mutex::new(Vec::new()),
+            forwards: Mutex::new(HashMap::new()),
+            remote_forwards: owner
+                .as_ref()
+                .map(|s| s.remote_forwards.clone())
+                .unwrap_or_default(),
+            owner,
             stop: Mutex::new(Some(stop)),
         });
         self.sessions
@@ -163,10 +204,15 @@ impl Service {
                         && !matches!(running.state.lock().unwrap().status,Status::Failed(_)) {running.status(Status::Failed(error));}
                 }
             }
+            for job in running.forwards() {job.stop();}
             // Disconnect is a transport-level action even when independently
             // opened SFTP/exec channels still hold network sender references.
             let transport=running.transport.lock().unwrap().take();
-            if let Some(ssh)=transport {let _=tokio::time::timeout(Duration::from_millis(500),ssh.disconnect(russh::Disconnect::ByApplication,"Session ended","en")).await;}
+            if running.owner.is_none() && let Some(ssh)=transport {let _=tokio::time::timeout(Duration::from_millis(500),ssh.disconnect(russh::Disconnect::ByApplication,"Session ended","en")).await;}
+            let hops = std::mem::take(&mut *running.hops.lock().unwrap());
+            for hop in hops.into_iter().rev() { let _ = tokio::time::timeout(Duration::from_millis(500), hop.disconnect(russh::Disconnect::ByApplication, "Route ended", "en")).await; }
+            running.auth_reply.lock().unwrap().take();
+            running.state.lock().unwrap().authentication = None;
             // Hard-close the shared TCP stream even if the transport control
             // queue is itself blocked or another channel retains a sender.
             if let Some(socket)=running.socket.lock().unwrap().take() {let _=socket.shutdown(std::net::Shutdown::Both);}
@@ -235,10 +281,14 @@ impl Session {
         if let Some(stop) = self.stop.lock().unwrap().take() {
             let _ = stop.send(());
         }
+        for job in self.forwards() {
+            job.stop();
+        }
         self.trust(false);
+        self.auth_reply.lock().unwrap().take();
     }
     /// Opens an independent channel on this immutable session, for SFTP/exec.
-    pub async fn open_channel(&self) -> Result<russh::Channel<russh::client::Msg>, String> {
+    pub async fn open_channel(&self) -> Result<channel::ManagedChannel, String> {
         if self.state.lock().unwrap().status != Status::Connected {
             return Err("Connection not ready".into());
         }
@@ -254,9 +304,36 @@ impl Session {
 struct Handler {
     session: Arc<Session>,
     keys: PathBuf,
+    profile: ConnectionProfile,
 }
 impl client::Handler for Handler {
     type Error = russh::Error;
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        address: &str,
+        port: u32,
+        _: &str,
+        _: u32,
+        reply: client::ChannelOpenHandle,
+        _: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let sender = self
+            .session
+            .remote_forwards
+            .lock()
+            .unwrap()
+            .get(&(address.to_string(), port))
+            .cloned();
+        if let Some(sender) = sender
+            && let Ok(permit) = sender.try_reserve()
+        {
+            reply.accept().await;
+            permit.send(channel);
+        }
+        Ok(())
+    }
+
     async fn check_server_key(
         &mut self,
         key: &russh::keys::PublicKeyOrCertificate,
@@ -271,11 +348,7 @@ impl client::Handler for Handler {
                 return Ok(false);
             }
         };
-        let previous = match keys.verify(
-            &self.session.profile.host,
-            self.session.profile.port,
-            &fingerprint,
-        ) {
+        let previous = match keys.verify(&self.profile.host, self.profile.port, &fingerprint) {
             Verification::Trusted => return Ok(true),
             Verification::Unknown => None,
             Verification::Changed(old) => Some(old),
@@ -307,11 +380,7 @@ impl client::Handler for Handler {
         };
         match (
             &previous,
-            keys.verify(
-                &self.session.profile.host,
-                self.session.profile.port,
-                &fingerprint,
-            ),
+            keys.verify(&self.profile.host, self.profile.port, &fingerprint),
         ) {
             (_, Verification::Trusted) => return Ok(true),
             (None, Verification::Unknown) => {}
@@ -323,11 +392,7 @@ impl client::Handler for Handler {
                 return Ok(false);
             }
         }
-        keys.trust(
-            &self.session.profile.host,
-            self.session.profile.port,
-            fingerprint,
-        );
+        keys.trust(&self.profile.host, self.profile.port, fingerprint);
         if let Err(e) = keys.save(&self.keys) {
             self.session.status(Status::Failed(e));
             return Ok(false);
@@ -344,101 +409,105 @@ async fn run(
     outgoing: mpsc::Receiver<Vec<u8>>,
     terminal: bool,
 ) -> Result<(), String> {
-    if session.profile.jump_resource.is_some() {
-        return Err("Jump hosts are not configured for this connection".into());
-    }
-    let handler = Handler {
-        session: session.clone(),
-        keys,
-    };
-    let config = Arc::new(client::Config {
-        keepalive_interval: Some(Duration::from_secs(30)),
-        keepalive_max: 3,
-        ..Default::default()
-    });
-    let connecting = async {
-        let socket =
-            tokio::net::TcpStream::connect((session.profile.host.as_str(), session.profile.port))
-                .await?;
-        if config.nodelay {
-            let _ = socket.set_nodelay(true);
-        }
-        let socket = socket.into_std()?;
-        *session.socket.lock().unwrap() = Some(socket.try_clone()?);
-        client::connect_stream(config, tokio::net::TcpStream::from_std(socket)?, handler).await
-    };
-    let mut ssh = tokio::time::timeout(Duration::from_secs(150), connecting)
-        .await
-        .map_err(|_| "Connection timed out".to_string())?
-        .map_err(|_| "SSH connection or host-key verification failed".to_string())?;
-    session.status(Status::Authenticating);
-    if !matches!(session.profile.auth, AuthMethod::None)
-        && secret.expose().is_empty()
-        && let Some(reference) = session.profile.credential_ref.clone()
-    {
-        secret = tokio::task::spawn_blocking(move || credentials::load(&reference))
-            .await
-            .map_err(|_| "Keychain task failed".to_string())??;
-    }
-    let result = match &session.profile.auth {
-        AuthMethod::Password => {
-            ssh.authenticate_password(&session.profile.username, secret.expose())
-                .await
-        }
-        AuthMethod::None => ssh.authenticate_none(&session.profile.username).await,
-        AuthMethod::PrivateKey { path } => {
-            let path = path.clone();
-            let passphrase = Secret::new(secret.expose().to_string());
-            let key = tokio::task::spawn_blocking(move || {
-                russh::keys::load_secret_key(
-                    path,
-                    if passphrase.expose().is_empty() {
-                        None
-                    } else {
-                        Some(passphrase.expose())
-                    },
-                )
-            })
-            .await
-            .map_err(|_| "Private-key task failed".to_string())?
-            .map_err(|_| "Cannot read private key or incorrect passphrase".to_string())?;
-            let hash = ssh
-                .best_supported_rsa_hash()
-                .await
-                .map_err(|_| "Key negotiation failed".to_string())?
-                .flatten();
-            ssh.authenticate_publickey(
-                &session.profile.username,
-                PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-            )
-            .await
-        }
-    }
-    .map_err(|_| "Authentication transport failed".to_string())?;
-    if !result.success() {
-        return Err("Authentication rejected".into());
-    }
-    if remember && !matches!(session.profile.auth, AuthMethod::None) {
-        let reference = session
-            .profile
-            .credential_ref
+    if let Some(owner) = &session.owner {
+        let ssh = owner
+            .transport
+            .lock()
+            .unwrap()
             .clone()
-            .ok_or("Missing keychain reference")?;
-        tokio::task::spawn_blocking(move || credentials::save(&reference, &secret))
-            .await
-            .map_err(|_| "Keychain task failed".to_string())??;
+            .ok_or("Shared transport disconnected")?;
+        return connected(session, ssh, commands, outgoing, terminal).await;
     }
-    connected(session, ssh, commands, outgoing, terminal).await
+    let profiles = session.profile.route_profiles()?;
+    let total = profiles.len();
+    let mut previous: Option<Arc<client::Handle<Handler>>> = None;
+    for (index, profile) in profiles.into_iter().enumerate() {
+        let hop = auth::HopIdentity {
+            host: profile.host.clone(),
+            port: profile.port,
+            username: profile.username.clone(),
+            index,
+            total,
+        };
+        {
+            let mut state = session.state.lock().unwrap();
+            state.hop = Some(hop.clone());
+            state.revision += 1;
+        }
+        let handler = Handler {
+            session: session.clone(),
+            keys: keys.clone(),
+            profile: profile.clone(),
+        };
+        let config = Arc::new(client::Config {
+            keepalive_interval: Some(Duration::from_secs(30)),
+            keepalive_max: 3,
+            ..Default::default()
+        });
+        let connecting = async {
+            if let Some(parent) = &previous {
+                let channel = parent
+                    .channel_open_direct_tcpip(&profile.host, profile.port.into(), "127.0.0.1", 0)
+                    .await?;
+                client::connect_stream(config, channel.into_stream(), handler).await
+            } else {
+                let socket =
+                    tokio::net::TcpStream::connect((profile.host.as_str(), profile.port)).await?;
+                if config.nodelay {
+                    let _ = socket.set_nodelay(true);
+                }
+                let socket = socket.into_std()?;
+                *session.socket.lock().unwrap() = Some(socket.try_clone()?);
+                client::connect_stream(config, tokio::net::TcpStream::from_std(socket)?, handler)
+                    .await
+            }
+        };
+        let mut ssh = tokio::time::timeout(Duration::from_secs(150), connecting)
+            .await
+            .map_err(|_| "Connection timed out")?
+            .map_err(|_| "SSH connection or host-key verification failed")?;
+        let final_hop = index + 1 == total;
+        let hop_secret = if final_hop {
+            std::mem::replace(&mut secret, Secret::new(String::new()))
+        } else {
+            Secret::new(String::new())
+        };
+        tokio::time::timeout(
+            Duration::from_secs(180),
+            auth::authenticate(
+                &session,
+                &mut ssh,
+                &profile,
+                hop,
+                hop_secret,
+                remember && final_hop,
+                !final_hop,
+            ),
+        )
+        .await
+        .map_err(|_| "Authentication timed out")??;
+        if final_hop {
+            return connected(session, Arc::new(ssh), commands, outgoing, terminal).await;
+        }
+        let ssh = Arc::new(ssh);
+        session.hops.lock().unwrap().push(ssh.clone());
+        previous = Some(ssh);
+    }
+    Err("Empty jump route".into())
 }
 async fn connected(
     session: Arc<Session>,
-    ssh: client::Handle<Handler>,
+    ssh: Arc<client::Handle<Handler>>,
     mut commands: mpsc::Receiver<Command>,
     mut outgoing: mpsc::Receiver<Vec<u8>>,
     terminal: bool,
 ) -> Result<(), String> {
-    let ssh = Arc::new(ssh);
     *session.transport.lock().unwrap() = Some(ssh.clone());
+    let mut terminal_permit = if terminal {
+        Some(session.capacity.acquire(session.profile.transport_policy)?)
+    } else {
+        None
+    };
     let (mut reader, mut writer) = if terminal {
         let channel = ssh
             .channel_open_session()
@@ -477,7 +546,7 @@ async fn connected(
     let mut openings = tokio::task::JoinSet::new();
     session.status(Status::Connected);
     loop {
-        if ssh.is_closed() {
+        if ssh.is_closed() && reader.is_none() {
             break;
         }
         tokio::select! {
@@ -489,9 +558,11 @@ async fn connected(
             command = commands.recv() => match command {
                 Some(Command::Resize(cols,rows)) => { session.state.lock().unwrap().terminal.resize(cols as usize,rows as usize); if let Some(writer)=&writer && writer.window_change(cols,rows,0,0).await.is_err() {session.terminal_finished(Some("Terminal resize failed".into()));} }
                 Some(Command::Open(reply)) => {
+                    let permit = match session.capacity.acquire(session.profile.transport_policy) {Ok(permit)=>permit,Err(error)=>{let _=reply.send(Err(error));continue;}};
                     let ssh=ssh.clone();
                     openings.spawn(async move {
                         let result=tokio::time::timeout(Duration::from_secs(30),ssh.channel_open_session()).await.map_err(|_|"Channel open timed out".to_string()).and_then(|result|result.map_err(|_|"Server refused channel".to_string()));
+                        let result = result.map(|channel| channel::ManagedChannel::new(channel,permit));
                         if let Err(Ok(channel))=reply.send(result) {let _=channel.close().await;}
                     });
                 }
@@ -505,11 +576,11 @@ async fn connected(
                 Some(ChannelMsg::ExitStatus {exit_status})=>{let mut state=session.state.lock().unwrap();state.exit_status=Some(exit_status);state.revision+=1;},
                 Some(ChannelMsg::Eof)=>{let mut state=session.state.lock().unwrap();state.remote_eof=true;state.revision+=1;},
                 Some(ChannelMsg::Failure) => {
-                    reader=None;writer=None;writing=None;
+                    reader=None;writer=None;writing=None;terminal_permit.take();
                     session.terminal_finished(Some("Server refused PTY or shell (SFTP-only hosts need the SFTP view)".into()));
                 },
                 Some(ChannelMsg::Close) | None => {
-                    reader=None;writer=None;writing=None;session.terminal_finished(None);
+                    reader=None;writer=None;writing=None;terminal_permit.take();session.terminal_finished(None);
                 },
                 _ => {}
             }
@@ -572,3 +643,6 @@ mod tests;
 
 #[cfg(test)]
 mod adverse_tests;
+
+#[cfg(test)]
+mod advanced_tests;

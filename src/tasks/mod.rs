@@ -708,7 +708,7 @@ impl TransferManager {
                 .unwrap()
                 .values()
                 .filter(|w| !matches!(w.job.state, JobState::Complete | JobState::Skipped))
-                .filter(|w| [&w.spec.source, &w.spec.target].into_iter().all(|e| !matches!(e, Endpoint::Remote { transport, .. } if transport.profile.ephemeral)))
+                .filter(|w| [&w.spec.source, &w.spec.target].into_iter().all(|e| !matches!(e, Endpoint::Remote { transport, .. } if transport.profile.contains_temporary_endpoint())))
                 .map(|w| Recovery {
                     id: w.recovery_id.clone(),
                     claimed: false,

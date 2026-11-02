@@ -139,6 +139,11 @@ impl Settings {
     /// Transient resources and their view identities never enter recovery snapshots.
     pub fn persistent_snapshot(&self) -> Self {
         let mut saved = self.clone();
+        for resource in &mut saved.workspace.resources {
+            for profile in &mut resource.profiles {
+                profile.route = None;
+            }
+        }
         let transient: std::collections::HashSet<_> = saved
             .workspace
             .resources
@@ -314,6 +319,8 @@ impl Settings {
                     credential_ref: None,
                     auth: crate::workspace::AuthMethod::default(),
                     jump_resource: None,
+                    route: None,
+                    transport_policy: Default::default(),
                 });
                 s.recovery = Some("recovered_profile".into());
             }

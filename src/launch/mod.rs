@@ -161,6 +161,9 @@ impl OpenRequest {
                 {
                     return Err(invalid());
                 }
+                if matches!(c.auth, AuthMethod::Agent | AuthMethod::KeyboardInteractive) {
+                    return Err(invalid());
+                }
                 if let AuthMethod::PrivateKey { path } = &c.auth
                     && (path.is_empty() || !valid_text(path))
                 {
@@ -217,6 +220,8 @@ impl OpenRequest {
                             credential_ref: None,
                             auth: c.auth.clone(),
                             jump_resource: None,
+                            route: None,
+                            transport_policy: Default::default(),
                         }],
                     });
                     id
