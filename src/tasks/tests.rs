@@ -52,7 +52,7 @@ async fn source_and_target_are_revalidated_before_retry() {
 async fn task_survives_closed_and_retargeted_views_and_conflicts() {
     let p = root("target");
     std::fs::write(p.join("a"), b"content").unwrap();
-    let mut w = crate::workspace::Workspace::default();
+    let mut w = crate::workspace::Workspace::demo_fixture();
     let view = w.open(
         crate::workspace::ToolKind::Sftp,
         crate::workspace::TargetMode::Follow,

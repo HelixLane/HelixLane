@@ -7,7 +7,7 @@ use gpui_kit::{
     component::{
         Sizable,
         button::{Button, ButtonVariants},
-        input::{Input, InputState},
+        input::{Input, InputEvent, InputState},
     },
     prelude::FluentBuilder as _,
     *,
@@ -48,7 +48,11 @@ pub struct TerminalPane {
     focus: FocusHandle,
     bounds: Rc<RefCell<Bounds<Pixels>>>,
     selecting: Option<(usize, usize)>,
+    cell_width: f32,
+    cell_height: f32,
+    search_found: Option<bool>,
     _search_subscription: Subscription,
+    _search_enter: Subscription,
     preedit: String,
     composition_target: Option<u64>,
 }
@@ -91,9 +95,17 @@ impl TerminalPane {
             AuthMethod::PrivateKey { path } => path.clone(),
             _ => String::new(),
         };
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Find in visible screen"));
+        let search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Find in history / 搜索历史"));
         let search_subscription = cx.observe(&search, |_, _, cx| cx.notify());
+        let search_enter =
+            cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { shift, .. } = event {
+                    this.find(*shift, cx);
+                }
+            });
         Self {
+            _search_enter: search_enter,
             owned_terminals: vec![],
             owned_forwards: vec![],
             transport_only: false,
@@ -148,6 +160,9 @@ impl TerminalPane {
             focus: cx.focus_handle(),
             bounds: Default::default(),
             selecting: None,
+            cell_width: 8.4,
+            cell_height: 20.,
+            search_found: None,
         }
     }
     pub fn cancel_owned_jobs(&mut self) {
@@ -185,6 +200,15 @@ impl TerminalPane {
             });
         }
         self._search_subscription = cx.observe(&self.search, |_, _, cx| cx.notify());
+        self._search_enter = cx.subscribe_in(
+            &self.search,
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { shift, .. } = event {
+                    this.find(*shift, cx);
+                }
+            },
+        );
         self.preedit.clear();
         self.composition_target = None;
         self.sync_binding_inputs(window, cx);
@@ -408,10 +432,18 @@ impl TerminalPane {
         window.focus(&self.focus, cx);
         cx.notify();
     }
+    fn find(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        let query = self.search.read(cx).value().to_string();
+        self.search_found = self
+            .session
+            .as_ref()
+            .map(|s| s.state.lock().unwrap().terminal.find(&query, backwards));
+        cx.notify();
+    }
     fn position(&self, position: Point<Pixels>) -> (usize, usize) {
         let bounds = *self.bounds.borrow();
-        let x = f32::from(position.x - bounds.origin.x).max(0.) / 8.4;
-        let y = f32::from(position.y - bounds.origin.y).max(0.) / 20.;
+        let x = f32::from(position.x - bounds.origin.x).max(0.) / self.cell_width;
+        let y = f32::from(position.y - bounds.origin.y).max(0.) / self.cell_height;
         let dimensions = self
             .session
             .as_ref()
@@ -540,7 +572,7 @@ impl Render for TerminalPane {
                 format!("{}{hop_label}", text("Authenticating…", "正在认证…"))
             }
             Status::Connected => format!(
-                "{} · #{}",
+                "{}{}",
                 if terminal_status == TerminalStatus::Finished {
                     text(
                         "Shell finished · SSH connected",
@@ -549,7 +581,7 @@ impl Render for TerminalPane {
                 } else {
                     text("Connected", "已连接")
                 },
-                self.session.as_ref().unwrap().id
+                ""
             ),
             Status::Disconnected => text("Disconnected", "未连接").into(),
             Status::HostKey { .. } => {
@@ -558,7 +590,7 @@ impl Render for TerminalPane {
             Status::Failed(e) => format!(
                 "{}{hop_label}: {}",
                 text("Connection failed", "连接失败"),
-                language.ssh_error(e)
+                language.ssh_message(e)
             ),
         };
         if let Some(notice) = self
@@ -572,7 +604,7 @@ impl Render for TerminalPane {
                     .py_1()
                     .text_size(px(11.))
                     .text_color(rgb(p.warning))
-                    .child(language.ssh_error(&notice).to_string()),
+                    .child(language.ssh_message(&notice).to_string()),
             );
         }
         content = content.child(
@@ -602,6 +634,14 @@ impl Render for TerminalPane {
                     action("connect", text("Connect", "连接"))
                         .on_click(cx.listener(|this, _, w, cx| this.connect(w, cx)))
                 })
+                .child(
+                    action("network-config", text("SSH options…", "SSH 选项…")).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.show_network = !this.show_network;
+                            cx.notify();
+                        }),
+                    ),
+                )
                 .when(!self.transport_only, |d| {
                     d.child(
                         action("copy", text("Copy", "复制"))
@@ -829,23 +869,6 @@ impl Render for TerminalPane {
                 )),
             ));
         }
-        content = content.child(
-            action(
-                "network-config",
-                if self.show_network {
-                    text("Hide SSH networking", "收起 SSH 网络配置")
-                } else {
-                    text(
-                        "SSH networking / jump hosts / forwarding",
-                        "SSH 网络 / 跳板 / 转发",
-                    )
-                },
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.show_network = !this.show_network;
-                cx.notify();
-            })),
-        );
         if self.show_network {
             use helixlane::workspace::TransportPolicy;
             let policy = self.profile.transport_policy;
@@ -1038,7 +1061,11 @@ impl Render for TerminalPane {
                         }
                         ForwardStatus::Stopped => text("Stopped", "已停止").into(),
                         ForwardStatus::Failed(error) => {
-                            format!("{}: {}", text("Failed", "失败"), language.ssh_error(error))
+                            format!(
+                                "{}: {}",
+                                text("Failed", "失败"),
+                                language.ssh_message(error)
+                            )
                         }
                     };
                     let status = format!("#{} {kind} · {state}{destination}", job.id);
@@ -1067,9 +1094,44 @@ impl Render for TerminalPane {
         if self.transport_only {
             return content.into_any_element();
         }
-        let query = self.search.read(cx).value().to_string();
+        let font = self.settings.borrow().terminal_font.sanitized();
+        let font_id = cx
+            .text_system()
+            .resolve_font(&gpui_kit::font(font.family.clone()));
+        let cell_width = f32::from(
+            cx.text_system()
+                .advance(font_id, px(font.size as f32), 'M')
+                .map(|s| s.width)
+                .unwrap_or(px(font.size as f32 * 0.6)),
+        )
+        .max(1.);
+        let cell_height = (font.size as f32 * 1.45).ceil();
+        self.cell_width = cell_width;
+        self.cell_height = cell_height;
         if self.session.is_some() {
-            content=content.child(row().px_3().py_1().gap_2().child(div().w(px(230.)).child(Input::new(&self.search).small())).child(div().text_size(px(10.)).text_color(rgb(p.muted)).child(if cfg!(target_os="macos") {text("⌘C / V / F · drag to select · sessions stay open when views close","⌘C / V / F · 拖动选择 · 关闭视图后会话继续运行")} else {text("Ctrl+Shift+C / V / F · drag to select · sessions stay open when views close","Ctrl+Shift+C / V / F · 拖动选择 · 关闭视图后会话继续运行")})));
+            content = content.child(
+                row()
+                    .px_3()
+                    .py_1()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&self.search).small()),
+                    )
+                    .child(
+                        action("find-prev", text("Previous", "上一个"))
+                            .on_click(cx.listener(|this, _, _, cx| this.find(true, cx))),
+                    )
+                    .child(
+                        action("find-next", text("Next", "下一个"))
+                            .on_click(cx.listener(|this, _, _, cx| this.find(false, cx))),
+                    )
+                    .when(self.search_found == Some(false), |d| {
+                        d.child(div().text_size(px(11.)).child(text("No match", "无匹配")))
+                    }),
+            );
         }
         let bounds = self.bounds.clone();
         let session = self.session.clone();
@@ -1123,7 +1185,9 @@ impl Render for TerminalPane {
                 if let Some(session) = &this.session {
                     let lines = match event.delta {
                         ScrollDelta::Lines(delta) => delta.y as i32,
-                        ScrollDelta::Pixels(delta) => (f32::from(delta.y) / 20.) as i32,
+                        ScrollDelta::Pixels(delta) => {
+                            (f32::from(delta.y) / this.cell_height) as i32
+                        }
                     };
                     session.state.lock().unwrap().terminal.scroll(lines);
                     cx.notify();
@@ -1134,8 +1198,11 @@ impl Render for TerminalPane {
                     move |bounds, _, _| {
                         *layout_bounds.borrow_mut() = bounds;
                         if let Some(session) = &layout_session {
-                            let cols = (f32::from(bounds.size.width) / 8.4).floor().max(2.) as u32;
-                            let rows = (f32::from(bounds.size.height) / 20.).floor().max(1.) as u32;
+                            let cols =
+                                (f32::from(bounds.size.width) / cell_width).floor().max(2.) as u32;
+                            let rows = (f32::from(bounds.size.height) / cell_height)
+                                .floor()
+                                .max(1.) as u32;
                             let state = session.state.lock().unwrap();
                             if state.status == Status::Connected
                                 && state.terminal_status == TerminalStatus::Running
@@ -1165,17 +1232,11 @@ impl Render for TerminalPane {
                 .absolute()
                 .top_0()
                 .left_0()
-                .font_family("monospace")
-                .text_size(px(14.))
-                .line_height(px(20.));
+                .font_family(font.family.clone())
+                .text_size(px(font.size as f32))
+                .line_height(px(cell_height));
             for (y, cells) in cells.into_iter().enumerate() {
-                let highlighted = !query.is_empty()
-                    && cells
-                        .iter()
-                        .map(|c| c.text.as_str())
-                        .collect::<String>()
-                        .contains(&query);
-                let mut line = row().h(px(20.)).items_start();
+                let mut line = row().h(px(cell_height)).items_start();
                 let mut runs: Vec<(String, usize, u32, u32, bool)> = Vec::new();
                 for cell in cells {
                     let x = cell.column;
@@ -1187,7 +1248,7 @@ impl Render for TerminalPane {
                     if cursor == Some((x, y)) && terminal_running {
                         bg = p.accent;
                         fg = p.editor;
-                    } else if highlighted || cell.selected {
+                    } else if cell.selected {
                         bg = p.selected;
                     }
                     let width = if cell.wide { 2 } else { 1 };
@@ -1205,9 +1266,9 @@ impl Render for TerminalPane {
                 for (text, columns, fg, bg, bold) in runs {
                     line = line.child(
                         div()
-                            .w(px(8.4 * columns as f32))
+                            .w(px(cell_width * columns as f32))
                             .flex_none()
-                            .h(px(20.))
+                            .h(px(cell_height))
                             .text_color(rgb(fg))
                             .bg(rgb(bg))
                             .when(bold, |d| d.font_weight(FontWeight::BOLD))
@@ -1223,12 +1284,12 @@ impl Render for TerminalPane {
                 screen = screen.child(
                     div()
                         .absolute()
-                        .left(px(col as f32 * 8.4))
-                        .top(px(row as f32 * 20.))
+                        .left(px(col as f32 * cell_width))
+                        .top(px(row as f32 * cell_height))
                         .bg(rgb(p.editor))
                         .text_color(rgb(p.text))
-                        .font_family("monospace")
-                        .text_size(px(14.))
+                        .font_family(font.family.clone())
+                        .text_size(px(font.size as f32))
                         .border_b_1()
                         .border_color(rgb(p.accent))
                         .child(self.preedit.clone()),
@@ -1291,7 +1352,7 @@ mod windowless_auth_tests {
             gpui_kit::init(cx);
             cx.set_quit_mode(gpui::QuitMode::Explicit);
         });
-        let mut settings = Settings::default();
+        let mut settings = Settings::demo_fixture();
         let id = settings.workspace.open(ToolKind::Sftp, TargetMode::Follow);
         let first = settings.workspace.capture_task_target(id).unwrap().profile;
         settings.workspace.activate_resource(2);

@@ -1,7 +1,8 @@
 use super::*;
 use std::collections::BTreeSet;
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum Sort {
+    #[default]
     Name,
     Size,
     Modified,
@@ -122,7 +123,7 @@ mod tests {
     }
     #[test]
     fn four_fixed_host_browsers_keep_independent_history_and_selection() {
-        let mut w = crate::workspace::Workspace::default();
+        let mut w = crate::workspace::Workspace::demo_fixture();
         let mut browsers = vec![];
         for id in 1..=4 {
             let view = w.open(

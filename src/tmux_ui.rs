@@ -58,8 +58,12 @@ impl TmuxPane {
             a.transport_only();
             a
         });
-        let visibility =
-            cx.observe_window_visibility(w, |this, v, _, _| this.window_visible = v.is_visible());
+        let visibility = cx.observe_window_visibility(w, |this, v, _, _| {
+            if v.is_visible() && !this.window_visible {
+                this.last_refresh = std::time::Instant::now() - Duration::from_secs(6);
+            }
+            this.window_visible = v.is_visible();
+        });
         let ticket = settings.borrow().workspace.ticket(id);
         let mut this = Self {
             polling: None,
@@ -133,9 +137,16 @@ impl TmuxPane {
         }
     }
     pub fn rebind_window(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if w.is_visible() && !self.window_visible {
+            self.last_refresh = std::time::Instant::now() - Duration::from_secs(6);
+        }
         self.window_visible = w.is_visible();
-        self.visibility =
-            cx.observe_window_visibility(w, |this, v, _, _| this.window_visible = v.is_visible());
+        self.visibility = cx.observe_window_visibility(w, |this, v, _, _| {
+            if v.is_visible() && !this.window_visible {
+                this.last_refresh = std::time::Instant::now() - Duration::from_secs(6);
+            }
+            this.window_visible = v.is_visible();
+        });
         for field in [&mut self.name, &mut self.rename] {
             let value = field.read(cx).value();
             *field = cx.new(|cx| InputState::new(w, cx).default_value(value));
@@ -497,7 +508,7 @@ mod windowless_binding_tests {
             gpui_kit::init(cx);
             cx.set_quit_mode(gpui::QuitMode::Explicit);
         });
-        let mut settings = Settings::default();
+        let mut settings = Settings::demo_fixture();
         let owned = settings.workspace.create_window(Some(1));
         let id = settings
             .workspace
@@ -540,6 +551,43 @@ mod windowless_binding_tests {
                 assert!(p.generation > before);
                 assert!(p.pending.is_none());
             });
+        });
+    }
+}
+
+#[cfg(all(test, feature = "shell-tests"))]
+mod visibility_tests {
+    use super::*;
+    use gpui_kit as gpui;
+    #[gpui::test]
+    fn native_show_requests_one_immediate_refresh(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_quit_mode(gpui::QuitMode::Explicit);
+        });
+        let mut settings = Settings::demo_fixture();
+        let id = settings.workspace.open(
+            helixlane::workspace::ToolKind::Tmux,
+            helixlane::workspace::TargetMode::Follow,
+        );
+        let profile = settings.workspace.capture_task_target(id).unwrap().profile;
+        let settings = Rc::new(RefCell::new(settings));
+        let window = cx.add_window(|w, cx| TmuxPane::new(id, profile, settings, w, cx));
+        let pane = window.root(cx).unwrap();
+        cx.simulate_window_visibility_change(window.into(), gpui::WindowVisibility::Hidden);
+        pane.update(cx, |p, _| {
+            assert!(!p.window_visible);
+            p.last_refresh = std::time::Instant::now();
+        });
+        cx.simulate_window_visibility_change(window.into(), gpui::WindowVisibility::Visible);
+        pane.update(cx, |p, _| {
+            assert!(p.window_visible);
+            assert!(p.last_refresh.elapsed() > Duration::from_secs(5));
+            p.last_refresh = std::time::Instant::now();
+        });
+        cx.simulate_window_visibility_change(window.into(), gpui::WindowVisibility::Visible);
+        pane.update(cx, |p, _| {
+            assert!(p.last_refresh.elapsed() < Duration::from_secs(1))
         });
     }
 }

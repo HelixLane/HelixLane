@@ -74,7 +74,7 @@ fn wire_is_bounded_versioned_and_secret_redacted() {
 #[test]
 fn saved_follow_identity_survives_external_activation() {
     use helixlane::{settings::Settings, workspace::*};
-    let mut s = Settings::default();
+    let mut s = Settings::demo_fixture();
     let saved = s.workspace.open(ToolKind::Terminal, TargetMode::Follow);
     s.workspace.views[0].session_id = Some(99);
     s.dock_layout = Some(
@@ -126,7 +126,7 @@ fn saved_follow_identity_survives_external_activation() {
 #[test]
 fn new_window_allocates_an_independent_destination() {
     let r = open(&["open", "alice@host", "--new-window"]);
-    let mut w = helixlane::workspace::Workspace::default();
+    let mut w = helixlane::workspace::Workspace::demo_fixture();
     let opened = r.apply(&mut w).unwrap();
     assert_ne!(w.owner(opened.view_id), Some(1));
     assert_eq!(w.views.len(), 1);
@@ -173,7 +173,7 @@ fn malformed_uri_fields_and_controls_fail() {
 }
 #[test]
 fn activation_and_new_view_have_stable_distinct_identities() {
-    let mut w = helixlane::workspace::Workspace::default();
+    let mut w = helixlane::workspace::Workspace::demo_fixture();
     let r = open(&["open", "alice@host"]);
     let first = r.apply(&mut w).unwrap();
     assert_eq!(r.apply(&mut w).unwrap(), first);
@@ -193,7 +193,7 @@ fn activation_and_new_view_have_stable_distinct_identities() {
 #[test]
 fn ephemeral_snapshot_prunes_only_temporary_nodes_and_never_live_workspace() {
     use helixlane::{settings::Settings, workspace::*};
-    let mut s = Settings::default();
+    let mut s = Settings::demo_fixture();
     let a = s.workspace.open(ToolKind::Terminal, TargetMode::Fixed(1));
     let temp = open(&[
         "open",
@@ -284,7 +284,7 @@ fn putty_rejects_non_host_sftp_urls() {
 #[test]
 fn saved_resource_new_view_remains_persistent() {
     use helixlane::settings::Settings;
-    let mut settings = Settings::default();
+    let mut settings = Settings::demo_fixture();
     let resource = settings.workspace.resources[0].clone();
     let request = open(&["open", "--resource", "1", "--sftp", "--new-view"]);
     let opened = request.apply(&mut settings.workspace).unwrap();

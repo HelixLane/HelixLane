@@ -1,3 +1,4 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod app;
 mod app_assets;
 mod application;
@@ -13,11 +14,8 @@ actions!(helixlane, [Quit, NewWindow, CloseWindow]);
 fn register_actions(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| {
         if let Some(owner) = cx.try_global::<application::ApplicationOwner>().cloned() {
-            if owner.windows().is_empty() {
-                cx.quit();
-            } else {
-                owner.close_active(cx);
-            }
+            let _ = owner.save();
+            cx.quit();
         } else {
             cx.quit();
         }
@@ -53,6 +51,16 @@ fn register_actions(cx: &mut App) {
     )
     .expect("close window key");
     cx.bind_keys([quit, new_window, close_window]);
+    cx.set_menus(vec![gpui_kit::Menu {
+        name: "HelixLane".into(),
+        disabled: false,
+        items: vec![
+            gpui_kit::MenuItem::action("New window / 新窗口", NewWindow),
+            gpui_kit::MenuItem::action("Close window / 关闭窗口", CloseWindow),
+            gpui_kit::MenuItem::separator(),
+            gpui_kit::MenuItem::action("Quit HelixLane / 退出全部任务", Quit),
+        ],
+    }]);
 }
 
 #[cfg(all(test, feature = "shell-tests"))]
@@ -71,6 +79,7 @@ mod startup_tests {
 }
 
 fn main() -> std::process::ExitCode {
+    helixlane::launch::attach_parent_console();
     let args = match helixlane::launch::os_arguments() {
         Ok(args) => args,
         Err(error) => {

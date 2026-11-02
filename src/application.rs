@@ -415,7 +415,7 @@ mod tests {
         cx.update(|cx| {
             gpui_shell::init(cx);
             gpui_kit::init(cx);
-            let mut settings = Settings::default();
+            let mut settings = Settings::demo_fixture();
             settings.workspace.ensure_windows();
             let id = settings
                 .workspace

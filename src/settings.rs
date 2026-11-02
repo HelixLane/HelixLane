@@ -12,7 +12,7 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_file(&path);
-        let mut s = Settings::default();
+        let mut s = Settings::demo_fixture();
         s.workspace.resources.truncate(2);
         s.workspace.resources[0].profiles[0].credential_ref = Some("keyring:host-a".into());
         s.workspace.resources[1].profiles[0].credential_ref = Some("keyring:host-b".into());
@@ -42,7 +42,7 @@ mod tests {
         let mut s = Settings {
             language: Language::Chinese,
             theme: ThemePreference::Light,
-            ..Settings::default()
+            ..Settings::demo_fixture()
         };
         let id = s.workspace.open(
             crate::workspace::ToolKind::Terminal,
@@ -61,7 +61,7 @@ mod tests {
     #[test]
     fn corrupt_settings_recover_credentials() {
         let path = std::env::temp_dir().join(format!("helix-test-{}.sqlite", std::process::id()));
-        let mut s = Settings::default();
+        let mut s = Settings::demo_fixture();
         s.workspace.resources[0].profiles[0].credential_ref = Some("keyring:opaque".into());
         s.save(&path).unwrap();
         let db = rusqlite::Connection::open(&path).unwrap();
@@ -87,11 +87,42 @@ pub enum ThemePreference {
     Dark,
     Light,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TerminalFont {
+    pub family: String,
+    pub size: u16,
+}
+impl Default for TerminalFont {
+    fn default() -> Self {
+        Self {
+            family: "monospace".into(),
+            size: 14,
+        }
+    }
+}
+impl TerminalFont {
+    pub fn sanitized(&self) -> Self {
+        let family = if self.family.is_empty()
+            || self.family.len() > 128
+            || self.family.chars().any(char::is_control)
+        {
+            "monospace".into()
+        } else {
+            self.family.clone()
+        };
+        Self {
+            family,
+            size: self.size.clamp(10, 28),
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub version: u32,
     pub language: Language,
     pub theme: ThemePreference,
+    #[serde(default)]
+    pub terminal_font: TerminalFont,
     pub workspace: Workspace,
     #[serde(default)]
     pub dock_layout: Option<serde_json::Value>,
@@ -106,6 +137,7 @@ impl Default for Settings {
             version: 2,
             language: Language::default(),
             theme: ThemePreference::System,
+            terminal_font: TerminalFont::default(),
             workspace: Workspace::default(),
             dock_layout: None,
             top_layout: None,
@@ -114,6 +146,13 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    pub fn demo_fixture() -> Self {
+        Self {
+            workspace: Workspace::demo_fixture(),
+            ..Self::default()
+        }
+    }
+
     pub fn path() -> PathBuf {
         if let Some(path) = std::env::var_os("HELIXLANE_SETTINGS") {
             return PathBuf::from(path);
@@ -139,6 +178,7 @@ impl Settings {
     /// Transient resources and their view identities never enter recovery snapshots.
     pub fn persistent_snapshot(&self) -> Self {
         let mut saved = self.clone();
+        saved.terminal_font = saved.terminal_font.sanitized();
         for resource in &mut saved.workspace.resources {
             for profile in &mut resource.profiles {
                 profile.route = None;
@@ -390,7 +430,7 @@ mod multiwindow_tests {
     use crate::workspace::{TargetMode, ToolKind};
     #[test]
     fn temporary_references_are_removed_from_every_window_and_dock() {
-        let mut settings = Settings::default();
+        let mut settings = Settings::demo_fixture();
         settings.workspace.ensure_windows();
         let other = settings.workspace.create_window(None);
         settings.workspace.resources[0].profiles[0].ephemeral = true;
@@ -443,7 +483,7 @@ mod multiwindow_tests {
     }
     #[test]
     fn window_geometry_and_top_extent_survive_serialization() {
-        let mut settings = Settings::default();
+        let mut settings = Settings::demo_fixture();
         settings.workspace.ensure_windows();
         let mut value = serde_json::to_value(&settings).unwrap();
         value["workspace"]["windows"][0]["bounds"] = serde_json::json!([10., 20., 1100., 700.]);
@@ -466,18 +506,48 @@ mod page_state_tests {
     use super::*;
     #[test]
     fn saved_file_navigation_restores_without_sessions_or_task_restart() {
-        let mut settings = Settings::default();
+        let mut settings = Settings::demo_fixture();
         let id = settings.workspace.open(
             crate::workspace::ToolKind::Sftp,
             crate::workspace::TargetMode::Fixed(1),
         );
         let mut value = serde_json::to_value(settings).unwrap();
-        let page = serde_json::json!({"resource":1,"local_path":"/tmp/local","remote_path":"/var/log","local_scroll":[0.,-80.],"remote_scroll":[0.,-120.]});
+        let page = serde_json::json!({"browser_hidden":[true,false],"browser_sort":["Size","Name"],"resource":1,"local_path":"/tmp/local","remote_path":"/var/log","local_scroll":[0.,-80.],"remote_scroll":[0.,-120.]});
         value["workspace"]["views"][0]["page"] = page.clone();
         let restored: Settings = serde_json::from_value(value).unwrap();
         let actual = serde_json::to_value(restored.persistent_snapshot()).unwrap();
         assert_eq!(actual["workspace"]["views"][0]["page"], page);
         assert_eq!(restored.workspace.views[0].id, id);
         assert_eq!(restored.workspace.views[0].session_id, None);
+    }
+}
+
+#[cfg(test)]
+mod production_tests {
+    use super::*;
+    #[test]
+    fn fresh_workspace_is_empty_and_old_preferences_have_safe_defaults() {
+        let settings = Settings::default();
+        assert!(settings.workspace.resources.is_empty());
+        assert!(settings.workspace.views.is_empty());
+        assert_eq!(settings.workspace.active_resource, None);
+        let mut old = serde_json::to_value(&settings).unwrap();
+        old.as_object_mut().unwrap().remove("terminal_font");
+        let restored: Settings = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.terminal_font, TerminalFont::default());
+        assert_eq!(
+            TerminalFont {
+                family: "bad\nfont".into(),
+                size: 65535
+            }
+            .sanitized(),
+            TerminalFont {
+                family: "monospace".into(),
+                size: 28
+            }
+        );
+        let page:crate::workspace::ViewPageState=serde_json::from_str(r#"{"resource":null,"local_path":null,"remote_path":null,"local_scroll":[0,0],"remote_scroll":[0,0]}"#).unwrap();
+        assert_eq!(page.browser_hidden, [false; 2]);
+        assert_eq!(page.browser_sort, [crate::sftp::browser::Sort::Name; 2]);
     }
 }

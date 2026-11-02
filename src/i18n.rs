@@ -570,6 +570,16 @@ impl Language {
 }
 
 impl Language {
+    pub fn ssh_message(self, error: &str) -> String {
+        if self == Self::Chinese
+            && let Some(id) = error
+                .strip_prefix("Jump resource #")
+                .and_then(|s| s.strip_suffix(" is missing or has no profile"))
+        {
+            return format!("跳板资源 #{id} 不存在或没有连接配置");
+        }
+        self.ssh_error(error).to_string()
+    }
     pub fn ssh_error(self, error: &str) -> &str {
         if self != Self::Chinese {
             return error;
@@ -616,6 +626,11 @@ impl Language {
             "Jump route has not been captured" => "尚未捕获跳板链配置",
             "Invalid captured jump route" => "捕获的跳板链配置无效",
             "SSH agent unavailable" => "SSH Agent 不可用",
+            "SSH agent supplied too many identities" => "SSH Agent 返回的身份超过 64 个上限",
+            "Invalid remote forwarding port" => "远程转发端口无效",
+            "Remote forward request timed out; connection closed to remove unknown listener" => {
+                "远程转发请求超时；已关闭连接以移除状态不明的监听端口"
+            }
             "SSH agent identity request failed" => "SSH Agent 身份请求失败",
             "SSH agent signing failed" => "SSH Agent 签名失败",
             "Authentication response count mismatch" => "认证回答数量不匹配",

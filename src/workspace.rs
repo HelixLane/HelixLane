@@ -3,7 +3,7 @@ mod tests {
     use super::*;
     #[test]
     fn missing_top_restore_is_recovered_without_being_mistaken_for_close() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let central = w.open(ToolKind::Sftp, TargetMode::Fixed(1));
         let top = w.open(ToolKind::Terminal, TargetMode::Fixed(2));
         w.move_view(top, Location::Top);
@@ -48,7 +48,7 @@ mod tests {
     }
     #[test]
     fn aggregate_tools_do_not_follow_resources() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let id = w.open(ToolKind::Services, TargetMode::Follow);
         w.activate_resource(2);
         assert_eq!(w.target(id), None);
@@ -56,7 +56,7 @@ mod tests {
     }
     #[test]
     fn moving_keeps_identity_and_session() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let id = w.open(ToolKind::Sftp, TargetMode::Fixed(1));
         w.views[0].session_id = Some(9);
         w.move_view(id, Location::Right);
@@ -65,7 +65,7 @@ mod tests {
     }
     #[test]
     fn fixed_ignores_follow_and_late_results_are_rejected() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let fixed = w.open(ToolKind::Sftp, TargetMode::Fixed(1));
         let follow = w.open(ToolKind::Terminal, TargetMode::Follow);
         w.activate_resource(1);
@@ -79,7 +79,7 @@ mod tests {
     }
     #[test]
     fn task_submission_is_immutable_and_closing_view_keeps_snapshot() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let id = w.open(ToolKind::Sftp, TargetMode::Follow);
         let submitted = w.capture_task_target(id).unwrap();
         w.activate_resource(2);
@@ -90,7 +90,7 @@ mod tests {
     }
     #[test]
     fn removed_resource_is_unavailable_and_visibility_only_pauses_refresh() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let id = w.open(ToolKind::Terminal, TargetMode::Fixed(1));
         w.views[0].session_id = Some(44);
         assert!(!w.should_refresh(id, false, false));
@@ -102,7 +102,7 @@ mod tests {
     }
     #[test]
     fn layout_roundtrip() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let a = w.open(ToolKind::Sftp, TargetMode::Fixed(1));
         w.move_view(a, Location::Top);
         let encoded = serde_json::to_string(&w).unwrap();
@@ -280,6 +280,10 @@ pub enum Location {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ViewPageState {
+    #[serde(default)]
+    pub browser_hidden: [bool; 2],
+    #[serde(default)]
+    pub browser_sort: [crate::sftp::browser::Sort; 2],
     pub resource: Option<ResourceId>,
     pub local_path: Option<String>,
     pub remote_path: Option<String>,
@@ -389,6 +393,19 @@ pub struct Workspace {
 }
 impl Default for Workspace {
     fn default() -> Self {
+        Self {
+            windows: vec![],
+            resources: vec![],
+            views: vec![],
+            layout: LayoutNode::default(),
+            active_resource: None,
+            next_id: 10,
+        }
+    }
+}
+impl Workspace {
+    /// Explicit disconnected fixture for QA and tests; never used by startup.
+    pub fn demo_fixture() -> Self {
         Self {
             windows: vec![],
             resources: (1..=4)
@@ -790,7 +807,7 @@ mod advanced_route_tests {
     use super::*;
     #[test]
     fn captured_target_contains_immutable_jump_profiles() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let destination = w.resources[0].id;
         let jump = w.add_resource();
         w.resources.last_mut().unwrap().profiles[0].host = "jump-a".into();
@@ -813,7 +830,7 @@ mod window_tests {
     use super::*;
     #[test]
     fn independent_context_and_detached_source_pause() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let other = w.create_window(None);
         let detached = w.create_window(Some(1));
         let a = w.open_in(1, ToolKind::Information, TargetMode::Follow);
@@ -832,7 +849,7 @@ mod window_tests {
     }
     #[test]
     fn moving_content_carries_actual_target_without_restarting_identity() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let other = w.create_window(None);
         let a = w.open_in(1, ToolKind::Sftp, TargetMode::Follow);
         w.views.iter_mut().find(|v| v.id == a).unwrap().session_id = Some(72);
@@ -856,7 +873,7 @@ mod window_tests {
     }
     #[test]
     fn window_layout_and_global_ids_roundtrip() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let other = w.create_window(None);
         let a = w.open_in(other, ToolKind::Sftp, TargetMode::Fixed(1));
         let b = w.open_in(other, ToolKind::Sftp, TargetMode::Fixed(2));
@@ -878,7 +895,7 @@ mod follow_chain_tests {
     use super::*;
     #[test]
     fn source_chain_pauses_transitively_and_cannot_cycle() {
-        let mut workspace = Workspace::default();
+        let mut workspace = Workspace::demo_fixture();
         let child = workspace.create_window(Some(1));
         let grandchild = workspace.create_window(Some(child));
         let view = workspace.open_in(grandchild, ToolKind::Information, TargetMode::Follow);
@@ -900,7 +917,7 @@ mod content_focus_tests {
     use super::*;
     #[test]
     fn auxiliary_activation_cannot_publish_context_and_source_roundtrip_rejects_old_ticket() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let other = w.create_window(None);
         let detached = w.create_window(Some(1));
         let nested = w.create_window(Some(detached));
@@ -928,7 +945,7 @@ mod background_window_tests {
     use super::*;
     #[test]
     fn closing_keeps_background_target_and_hiding_does_not_publish_context() {
-        let mut w = Workspace::default();
+        let mut w = Workspace::demo_fixture();
         let other = w.create_window(None);
         let following = w.open_in(1, ToolKind::Sftp, TargetMode::Follow);
         let fixed = w.open_in(1, ToolKind::Sftp, TargetMode::Fixed(3));

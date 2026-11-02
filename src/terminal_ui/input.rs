@@ -84,10 +84,10 @@ impl EntityInputHandler for TerminalPane {
             .cursor()?;
         Some(Bounds::new(
             point(
-                bounds.origin.x + px(col as f32 * 8.4),
-                bounds.origin.y + px(row as f32 * 20.),
+                bounds.origin.x + px(col as f32 * self.cell_width),
+                bounds.origin.y + px(row as f32 * self.cell_height),
             ),
-            size(px(8.4), px(20.)),
+            size(px(self.cell_width), px(self.cell_height)),
         ))
     }
     fn character_index_for_point(

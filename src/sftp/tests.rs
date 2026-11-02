@@ -10,7 +10,7 @@ mod fixture;
 #[test]
 fn openssh_backend_operations_atomic_upload_external_conflict_and_sftp_only_transport() {
     assert!(
-        std::path::Path::new("/usr/lib/openssh/sftp-server").exists(),
+        fixture::server_binary().exists(),
         "OpenSSH sftp-server is required for this integration test"
     );
     let root = std::env::temp_dir().join(format!("helixlane-openssh-test-{}", std::process::id()));

@@ -486,9 +486,35 @@ mod tests {
                     server.requests.recv_timeout(DEADLINE).unwrap().target,
                     super::super::Target::Focus
                 ));
+                let clients: Vec<_> = (0..8)
+                    .map(|_| std::thread::spawn(|| forward(&OpenRequest::focus())))
+                    .collect();
+                for client in clients {
+                    assert!(client.join().unwrap().unwrap());
+                }
+                for _ in 0..8 {
+                    assert!(matches!(
+                        server.requests.recv_timeout(DEADLINE).unwrap().target,
+                        super::super::Target::Focus
+                    ));
+                }
+                // An incomplete frame must time out without taking down the listener.
+                let mut held =
+                    std::os::unix::net::UnixStream::connect(dir.join("instance.sock")).unwrap();
+                use std::io::Read;
+                held.set_read_timeout(Some(DEADLINE + Duration::from_secs(1)))
+                    .unwrap();
+                let mut byte = [0];
+                assert_eq!(held.read(&mut byte).unwrap(), 0);
+                assert!(forward(&OpenRequest::focus()).unwrap());
+                assert!(server.requests.recv_timeout(DEADLINE).is_ok());
             }
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                eprintln!("AF_UNIX denied by runtime; native Unix endpoint test unavailable")
+                assert!(
+                    std::env::var_os("HELIXLANE_REQUIRE_NATIVE_INTEGRATION").is_none(),
+                    "Required native Unix IPC denied: {e}"
+                );
+                eprintln!("SKIP: AF_UNIX denied by runtime; native Unix endpoint test unavailable")
             }
             Err(e) => panic!("Unix probe: {e}"),
         }

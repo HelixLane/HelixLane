@@ -77,7 +77,7 @@ mod tests {
     use crate::workspace::Workspace;
     #[test]
     fn invalid_routes_are_explicit_and_saved_settings_strip_runtime_snapshots() {
-        let mut workspace = Workspace::default();
+        let mut workspace = Workspace::demo_fixture();
         let mut p = workspace.resources[0].profiles[0].clone();
         p.jump_resource = Some(999);
         p.capture_route(&workspace.resources);
@@ -100,7 +100,7 @@ mod tests {
         workspace.resources[0].profiles[0].ephemeral = true;
         p.capture_route(&workspace.resources);
         assert!(p.contains_temporary_endpoint());
-        let mut settings = crate::settings::Settings::default();
+        let mut settings = crate::settings::Settings::demo_fixture();
         settings.workspace.resources[0].profiles[0].route = p.route.clone();
         assert!(
             settings.persistent_snapshot().workspace.resources[0].profiles[0]

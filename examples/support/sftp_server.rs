@@ -5,6 +5,18 @@ use russh::{
     server::{self, Session as ServerSession},
 };
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
+pub fn server_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("HELIXLANE_SFTP_SERVER") {
+        return PathBuf::from(path);
+    }
+    if cfg!(target_os = "macos") {
+        "/usr/libexec/sftp-server".into()
+    } else if cfg!(windows) {
+        r"C:\Windows\System32\OpenSSH\sftp-server.exe".into()
+    } else {
+        "/usr/lib/openssh/sftp-server".into()
+    }
+}
 #[derive(Clone)]
 pub struct Fixture {
     pub root: PathBuf,
@@ -70,7 +82,7 @@ impl server::Handler for Fixture {
             s.channel_failure(id)?;
             return Ok(());
         };
-        let child = tokio::process::Command::new("/usr/lib/openssh/sftp-server")
+        let child = tokio::process::Command::new(server_binary())
             .arg("-d")
             .arg(&self.root)
             .stdin(Stdio::piped())

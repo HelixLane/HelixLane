@@ -249,7 +249,7 @@ mod tests {
         use super::super::{ResourceCapabilities, ToolProvider};
         use crate::workspace::{RunPolicy, TargetMode, ToolKind, Workspace};
         use std::cell::RefCell;
-        let workspace = Rc::new(RefCell::new(Workspace::default()));
+        let workspace = Rc::new(RefCell::new(Workspace::demo_fixture()));
         let id = workspace
             .borrow_mut()
             .open(ToolKind::Plugin, TargetMode::Follow);
@@ -302,7 +302,7 @@ mod tests {
     fn module_functions_reject_retained_handles_after_unload() {
         use super::super::{ResourceCapabilities, ToolProvider};
         use crate::workspace::{TargetMode, ToolKind, Workspace};
-        let mut workspace = Workspace::default();
+        let mut workspace = Workspace::demo_fixture();
         let id = workspace.open(ToolKind::Information, TargetMode::Follow);
         let mut instance = ToolProvider::plugin(EXAMPLE_ID, ResourceCapabilities::metadata())
             .instantiate(id, &workspace)
@@ -340,7 +340,7 @@ mod native_tests {
         }
     }
     fn instance(allowed: bool) -> ToolInstance {
-        let mut workspace = Workspace::default();
+        let mut workspace = Workspace::demo_fixture();
         let id = workspace.open(ToolKind::Plugin, TargetMode::Follow);
         ToolProvider::plugin(EXAMPLE_ID, ResourceCapabilities { metadata: allowed })
             .instantiate(id, &workspace)

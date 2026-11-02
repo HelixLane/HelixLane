@@ -435,3 +435,20 @@ mod ownership_tests {
         }
     }
 }
+
+/// Windows desktop/proxy binaries never allocate a console when launched by Explorer.
+/// A calling terminal may be attached; inherited redirected streams remain intact.
+pub fn attach_parent_console() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::{Foundation::INVALID_HANDLE_VALUE, System::Console::*};
+        let ids = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+        let handles = ids.map(|id| GetStdHandle(id));
+        AttachConsole(ATTACH_PARENT_PROCESS);
+        for (id, handle) in ids.into_iter().zip(handles) {
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                SetStdHandle(id, handle);
+            }
+        }
+    }
+}

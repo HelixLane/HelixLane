@@ -1144,6 +1144,16 @@ fn remote_admission_rejects_occupied_single_channel_before_confirmation() {
             attempt.is_err(),
             "server received channel-open confirmation while SingleChannel PTY was occupied"
         );
+        assert!(
+            session
+                .state
+                .lock()
+                .unwrap()
+                .input_notice
+                .as_deref()
+                .unwrap()
+                .starts_with("Single-channel connection is occupied")
+        );
         session.input(b"original-pty-survives".to_vec());
         wait(&session, |s| {
             s.terminal.text().contains("original-pty-survives")

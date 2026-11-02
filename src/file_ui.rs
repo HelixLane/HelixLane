@@ -214,6 +214,9 @@ impl FilePane {
             .unwrap_or_else(helixlane::sftp::local_home);
         let remote = page.remote_path.clone().unwrap_or_else(|| ".".into());
         let visibility = cx.observe_window_visibility(window, |this, visible, _, _| {
+            if visible.is_visible() && !this.window_visible {
+                this.last_refresh = std::time::Instant::now() - Duration::from_secs(6);
+            }
             this.window_visible = visible.is_visible()
         });
         let ticket = settings.borrow().workspace.ticket(id);
@@ -242,7 +245,7 @@ impl FilePane {
             window_handle: None,
             local_scroll: ScrollHandle::new(),
             remote_scroll: ScrollHandle::new(),
-            restore_scroll: Some(page),
+            restore_scroll: Some(page.clone()),
             id,
             visible: true,
             window_visible: window.is_visible(),
@@ -261,8 +264,18 @@ impl FilePane {
                 pending: None,
                 canonical_path_pending: None,
                 endpoint: None,
-                local: Browser::new(local.clone()),
-                remote: Browser::remote(remote),
+                local: {
+                    let mut b = Browser::new(local.clone());
+                    b.hidden = page.browser_hidden[0];
+                    b.sort = page.browser_sort[0];
+                    b
+                },
+                remote: {
+                    let mut b = Browser::remote(remote);
+                    b.hidden = page.browser_hidden[1];
+                    b.sort = page.browser_sort[1];
+                    b
+                },
                 busy: false,
                 error: None,
                 notice: None,
@@ -339,6 +352,8 @@ impl FilePane {
             resource: self.ticket.map(|t| t.resource_id),
             local_path: Some(state.local.path.clone()),
             remote_path: Some(state.remote.path.clone()),
+            browser_hidden: [state.local.hidden, state.remote.hidden],
+            browser_sort: [state.local.sort, state.remote.sort],
             local_scroll: [local.x.into(), local.y.into()],
             remote_scroll: [remote.x.into(), remote.y.into()],
         }
@@ -364,8 +379,14 @@ impl FilePane {
         self.auth.update(cx, |a, _| a.cancel_owned_jobs());
     }
     pub fn rebind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.is_visible() && !self.window_visible {
+            self.last_refresh = std::time::Instant::now() - Duration::from_secs(6);
+        }
         self.window_visible = window.is_visible();
         self.visibility = cx.observe_window_visibility(window, |this, visible, _, _| {
+            if visible.is_visible() && !this.window_visible {
+                this.last_refresh = std::time::Instant::now() - Duration::from_secs(6);
+            }
             this.window_visible = visible.is_visible()
         });
         for field in [
@@ -718,7 +739,13 @@ impl FilePane {
             {
                 continue;
             }
-            targets.push((*id, endpoint, state.remote.path.clone()));
+            let name = settings
+                .workspace
+                .target(*id)
+                .and_then(|id| settings.workspace.resources.iter().find(|r| r.id == id))
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| endpoint.label());
+            targets.push((name, endpoint, state.remote.path.clone()));
         }
         let (generation, conflict) = {
             let state = self.state.lock().unwrap();
@@ -951,6 +978,8 @@ impl FilePane {
                         let mut s = this.state.lock().unwrap();
                         let b = if remote { &mut s.remote } else { &mut s.local };
                         b.hidden = !b.hidden;
+                        drop(s);
+                        this.persist_page(cx);
                         cx.notify();
                     });
                 }),
@@ -992,6 +1021,8 @@ impl FilePane {
                             } else {
                                 s.local.sort = choice
                             }
+                            drop(s);
+                            this.persist_page(cx);
                             cx.notify();
                         });
                     },
@@ -1336,7 +1367,7 @@ impl Render for FilePane {
         let p = Palette::current(cx);
         let lang = self.settings.borrow().language;
         let zh = lang == Language::Chinese;
-        let t = |en, cn| if zh { cn } else { en };
+        let t = move |en, cn| if zh { cn } else { en };
         let mut content = div()
             .on_mouse_down(
                 MouseButton::Left,
@@ -1384,7 +1415,6 @@ impl Render for FilePane {
             content = content.child(t("Opening SFTP…", "正在打开 SFTP…"));
         }
         let conflict = state.conflict;
-        let delete = state.delete;
         let form = state.form;
         let target_description = state.pending.as_ref().map(|target| {
             format!(
@@ -1428,75 +1458,51 @@ impl Render for FilePane {
                             .on_click(cx.listener(|this, _, _, _| this.transfer(false))),
                     )
                     .child(self.copy_menu(lang, cx))
-                    .child(
-                        div()
-                            .text_color(rgb(p.muted))
-                            .child(t("Conflict:", "冲突：")),
-                    )
-                    .children(
-                        [
-                            (Conflict::Overwrite, t("Overwrite", "覆盖")),
-                            (Conflict::Skip, t("Skip", "跳过")),
-                            (Conflict::Rename, t("Rename", "重命名")),
-                        ]
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, (c, label))| {
-                            btn(
-                                ("conflict", i),
-                                format!(
-                                    "{}{}",
-                                    if std::mem::discriminant(&c)
-                                        == std::mem::discriminant(&conflict)
-                                    {
-                                        "✓ "
-                                    } else {
-                                        ""
-                                    },
-                                    label
-                                ),
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.state.lock().unwrap().conflict = c;
-                                    cx.notify();
-                                },
-                            ))
-                        }),
-                    ),
-            );
-        content = content.child(
-            row()
-                .flex_wrap()
-                .gap_1()
-                .children(
-                    [
-                        ("mkdir", t("New folder", "新建目录")),
-                        ("rename", t("Rename", "重命名")),
-                        ("chmod", t("Permissions", "权限")),
-                    ]
-                    .into_iter()
-                    .map(|(op, label)| {
-                        btn(op, label)
-                            .on_click(cx.listener(move |this, _, w, cx| this.open_form(op, w, cx)))
+                    .child({
+                        let owner = cx.entity().downgrade();
+                        btn("file-actions", t("Actions…", "操作…")).dropdown_menu(
+                            move |mut menu, _, _| {
+                                for (op, label) in [
+                                    ("mkdir", t("New folder…", "新建目录…")),
+                                    ("rename", t("Rename…", "重命名…")),
+                                    ("chmod", t("Permissions…", "权限…")),
+                                    ("edit", t("External edit…", "外部编辑…")),
+                                    ("delete", t("Delete selected…", "删除所选项…")),
+                                ] {
+                                    let owner = owner.clone();
+                                    menu = menu.item(PopupMenuItem::new(label).on_click(
+                                        move |_, w, cx| {
+                                            let _ = owner
+                                                .update(cx, |this, cx| this.open_form(op, w, cx));
+                                        },
+                                    ));
+                                }
+                                menu = menu.separator().label(t("Transfer conflicts", "传输冲突"));
+                                for (c, label) in [
+                                    (Conflict::Overwrite, t("Overwrite", "覆盖")),
+                                    (Conflict::Skip, t("Skip", "跳过")),
+                                    (Conflict::Rename, t("Rename", "重命名")),
+                                ] {
+                                    let owner = owner.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(label)
+                                            .checked(
+                                                std::mem::discriminant(&c)
+                                                    == std::mem::discriminant(&conflict),
+                                            )
+                                            .on_click(move |_, _, cx| {
+                                                let _ = owner.update(cx, |this, cx| {
+                                                    this.state.lock().unwrap().conflict = c;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    );
+                                }
+                                menu
+                            },
+                        )
                     }),
-                )
-                .child(
-                    btn(
-                        "delete",
-                        if delete {
-                            t("Confirm delete selected", "确认删除所选项")
-                        } else {
-                            t("Delete…", "删除…")
-                        },
-                    )
-                    .on_click(cx.listener(|this, _, w, cx| this.open_form("delete", w, cx))),
-                ),
-        );
-        content = content.child(
-            btn("external-edit", t("External edit…", "外部编辑…"))
-                .on_click(cx.listener(|this, _, w, cx| this.open_form("edit", w, cx))),
-        );
+            );
         if let Some(op) = form {
             let label = match op {
                 "mkdir" => t("Folder name", "目录名称"),
@@ -1964,7 +1970,7 @@ mod windowless_binding_tests {
             gpui_kit::init(cx);
             cx.set_quit_mode(gpui::QuitMode::Explicit);
         });
-        let mut settings = Settings::default();
+        let mut settings = Settings::demo_fixture();
         let owned = settings.workspace.create_window(Some(1));
         let id = settings
             .workspace
@@ -2046,7 +2052,7 @@ mod scoped_file_jobs_tests {
         let current = root.join("current-B");
         std::fs::write(&captured, b"A").unwrap();
         std::fs::write(&current, b"B").unwrap();
-        let mut settings = Settings::default();
+        let mut settings = Settings::demo_fixture();
         let id = settings.workspace.open(ToolKind::Sftp, TargetMode::Follow);
         let profile = settings.workspace.capture_task_target(id).unwrap().profile;
         let settings = Rc::new(RefCell::new(settings));
@@ -2095,7 +2101,7 @@ mod scoped_file_jobs_tests {
         });
         let root = std::env::temp_dir().join(format!("helix-file-cancel-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let mut settings = Settings::default();
+        let mut settings = Settings::demo_fixture();
         let first = settings
             .workspace
             .open(ToolKind::Sftp, TargetMode::Fixed(1));
@@ -2197,5 +2203,42 @@ mod scoped_file_jobs_tests {
             other.update(cx, |_, w, _| w.remove_window()).unwrap();
         });
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "shell-tests"))]
+mod visibility_tests {
+    use super::*;
+    use gpui_kit as gpui;
+    #[gpui::test]
+    fn native_show_requests_one_immediate_refresh(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_quit_mode(gpui::QuitMode::Explicit);
+        });
+        let mut settings = Settings::demo_fixture();
+        let id = settings.workspace.open(
+            helixlane::workspace::ToolKind::Sftp,
+            helixlane::workspace::TargetMode::Follow,
+        );
+        let profile = settings.workspace.capture_task_target(id).unwrap().profile;
+        let settings = Rc::new(RefCell::new(settings));
+        let window = cx.add_window(|w, cx| FilePane::new(id, profile, settings, w, cx));
+        let pane = window.root(cx).unwrap();
+        cx.simulate_window_visibility_change(window.into(), gpui::WindowVisibility::Hidden);
+        pane.update(cx, |p, _| {
+            assert!(!p.window_visible);
+            p.last_refresh = std::time::Instant::now();
+        });
+        cx.simulate_window_visibility_change(window.into(), gpui::WindowVisibility::Visible);
+        pane.update(cx, |p, _| {
+            assert!(p.window_visible);
+            assert!(p.last_refresh.elapsed() > Duration::from_secs(5));
+            p.last_refresh = std::time::Instant::now();
+        });
+        cx.simulate_window_visibility_change(window.into(), gpui::WindowVisibility::Visible);
+        pane.update(cx, |p, _| {
+            assert!(p.last_refresh.elapsed() < Duration::from_secs(1))
+        });
     }
 }

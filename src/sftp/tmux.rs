@@ -69,6 +69,10 @@ mod real_server_tests {
             .output()
             .is_err()
         {
+            assert!(
+                std::env::var_os("HELIXLANE_REQUIRE_NATIVE_INTEGRATION").is_none(),
+                "Required tmux executable unavailable"
+            );
             eprintln!("SKIP real tmux server: tmux executable unavailable");
             return;
         }
@@ -100,6 +104,10 @@ mod real_server_tests {
         if !created.status.success() {
             let error = String::from_utf8_lossy(&created.stderr);
             if error.contains("Operation not permitted") || error.contains("not supported") {
+                assert!(
+                    std::env::var_os("HELIXLANE_REQUIRE_NATIVE_INTEGRATION").is_none(),
+                    "Required tmux IPC denied: {error}"
+                );
                 eprintln!("SKIP real tmux server: observed unsupported local IPC: {error}");
                 let _ = std::fs::remove_dir_all(root);
                 return;

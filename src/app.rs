@@ -64,17 +64,6 @@ impl HelixLane {
         } else {
             "en"
         });
-        if window_id == 1 && shared.borrow().workspace.views.is_empty() {
-            let mut state = shared.borrow_mut();
-            state
-                .workspace
-                .open_in(window_id, ToolKind::Sftp, TargetMode::Fixed(1));
-            let services =
-                state
-                    .workspace
-                    .open_in(window_id, ToolKind::Services, TargetMode::Follow);
-            state.workspace.move_view(services, Location::Bottom);
-        }
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |w, cx| {
             let _ = weak.update(cx, |this, cx| this.request_close(None, w, cx));
@@ -629,6 +618,11 @@ impl HelixLane {
             .retain(|id, _| s.workspace.views.iter().any(|v| v.id == *id));
     }
     fn four_hosts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.borrow().workspace.resources.is_empty() {
+            self.settings.borrow_mut().workspace.resources =
+                helixlane::workspace::Workspace::demo_fixture().resources;
+            self.settings.borrow_mut().workspace.active_resource = Some(1);
+        }
         let resources: Vec<_> = self
             .settings
             .borrow()
@@ -931,7 +925,15 @@ impl HelixLane {
                     .child(div().text_size(px(13.)).child(lang.text("resources"))),
             )
             .child(
-                button("new", lang.text("new")).on_click(cx.listener(|this, _, window, cx| {
+                button(
+                    "new",
+                    if lang == Language::Chinese {
+                        "创建资源"
+                    } else {
+                        "Create resource"
+                    },
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
                     let id = this.settings.borrow_mut().workspace.add_resource();
                     this.edit(id, window, cx);
                 })),
@@ -1220,6 +1222,41 @@ impl Render for HelixLane {
                                     }),
                             );
                         }
+                        menu = menu.separator().label(if language == Language::Chinese {
+                            "终端字体"
+                        } else {
+                            "Terminal font"
+                        });
+                        for family in [
+                            "monospace",
+                            "JetBrains Mono",
+                            "DejaVu Sans Mono",
+                            "Menlo",
+                            "Consolas",
+                        ] {
+                            let owner = owner.clone();
+                            menu =
+                                menu.item(PopupMenuItem::new(family).on_click(move |_, _, cx| {
+                                    let _ = owner.update(cx, |this, cx| {
+                                        this.settings.borrow_mut().terminal_font.family =
+                                            family.into();
+                                        this.persist();
+                                        cx.refresh_windows();
+                                    });
+                                }));
+                        }
+                        for size in [12, 14, 16, 18, 20, 24] {
+                            let owner = owner.clone();
+                            menu = menu.item(PopupMenuItem::new(format!("{size} px")).on_click(
+                                move |_, _, cx| {
+                                    let _ = owner.update(cx, |this, cx| {
+                                        this.settings.borrow_mut().terminal_font.size = size;
+                                        this.persist();
+                                        cx.refresh_windows();
+                                    });
+                                },
+                            ));
+                        }
                         menu = menu.separator();
                         for (lang, label) in
                             [(Language::English, "English"), (Language::Chinese, "中文")]
@@ -1244,6 +1281,17 @@ impl Render for HelixLane {
                                     }),
                             );
                         }
+                        menu = menu.separator().item(
+                            PopupMenuItem::new(if language == Language::Chinese {
+                                "退出 HelixLane（结束全部任务）"
+                            } else {
+                                "Quit HelixLane (end all tasks)"
+                            })
+                            .on_click(|_, _, cx| cx.dispatch_action(&crate::Quit)),
+                        );
+                        if std::env::var_os("HELIXLANE_QA_FIXTURES").is_none() {
+                            return menu;
+                        }
                         let owner = owner.clone();
                         menu.separator().item(
                             PopupMenuItem::new(language.text("four_hosts")).on_click(
@@ -1261,7 +1309,54 @@ impl Render for HelixLane {
             .views
             .iter()
             .any(|v| v.window_id == self.window_id && v.location == Location::Top);
-        let center = if has_top {
+        let has_views = self
+            .settings
+            .borrow()
+            .workspace
+            .views
+            .iter()
+            .any(|v| v.window_id == self.window_id && v.location != Location::Services);
+        let center = if !has_views {
+            div()
+                .size_full()
+                .p_5()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(px(18.))
+                        .child(if language == Language::Chinese {
+                            "连接您的第一台服务器"
+                        } else {
+                            "Connect your first server"
+                        }),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(p.muted))
+                        .child(if language == Language::Chinese {
+                            "创建 SSH / SFTP 资源，然后打开终端或文件视图。"
+                        } else {
+                            "Create an SSH / SFTP resource, then open a terminal or file view."
+                        }),
+                )
+                .child(
+                    button(
+                        "empty-create-resource",
+                        if language == Language::Chinese {
+                            "创建资源"
+                        } else {
+                            "Create resource"
+                        },
+                    )
+                    .on_click(cx.listener(|this, _, w, cx| {
+                        let id = this.settings.borrow_mut().workspace.add_resource();
+                        this.edit(id, w, cx);
+                    })),
+                )
+                .into_any_element()
+        } else if has_top {
             v_resizable("top-and-center")
                 .on_resize({
                     let owner = cx.entity().downgrade();
@@ -1470,6 +1565,13 @@ impl Render for HelixLane {
             .workspace
             .window(self.window_id)
             .is_some_and(|w| w.follow_paused)
+            && self
+                .settings
+                .borrow()
+                .workspace
+                .views
+                .iter()
+                .any(|v| v.window_id == self.window_id && v.mode == TargetMode::Follow)
         {
             let owner = cx.entity().downgrade();
             let application = self.application.clone();
@@ -2174,6 +2276,15 @@ impl Render for ToolPanel {
         }
         drop(state);
         let tools = v.tool.resource_scoped().then(|| {
+            let endpoint = resource
+                .as_ref()
+                .map(|r| {
+                    format!(
+                        "{} · {}@{}:{}",
+                        r.name, r.profiles[0].username, r.profiles[0].host, r.profiles[0].port
+                    )
+                })
+                .unwrap_or_else(|| language.text("empty").into());
             row()
                 .h(px(34.))
                 .flex_none()
@@ -2183,23 +2294,14 @@ impl Render for ToolPanel {
                 .border_color(rgb(p.border))
                 .child(div().text_size(px(10.)).text_color(rgb(p.muted)).child("●"))
                 .child(
-                    div()
-                        .flex_1()
-                        .text_size(px(11.))
-                        .text_color(rgb(p.muted))
-                        .child(
-                            resource
-                                .as_ref()
-                                .map(|r| {
-                                    format!(
-                                        "{}@{}:{}",
-                                        r.profiles[0].username,
-                                        r.profiles[0].host,
-                                        r.profiles[0].port
-                                    )
-                                })
-                                .unwrap_or_else(|| language.text("empty").into()),
-                        ),
+                    div().flex_1().min_w_0().overflow_hidden().child(
+                        Button::new("target-details")
+                            .ghost()
+                            .small()
+                            .label(endpoint.clone())
+                            .tooltip(endpoint.clone())
+                            .dropdown_menu(move |menu, _, _| menu.label(endpoint.clone())),
+                    ),
                 )
                 .child(self.action(
                     if v.mode == TargetMode::Follow {
@@ -2385,7 +2487,7 @@ mod window_regression_tests {
         let (owner, id, original) = cx.update(|cx| {
             gpui_shell::init(cx);
             gpui_kit::init(cx);
-            let mut settings = Settings::default();
+            let mut settings = Settings::demo_fixture();
             settings.workspace.ensure_windows();
             let id = settings
                 .workspace

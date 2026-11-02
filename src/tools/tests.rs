@@ -4,7 +4,7 @@ use std::{cell::Cell, rc::Rc};
 
 #[test]
 fn context_capture_excludes_secrets_and_does_not_follow_later_edits() {
-    let mut workspace = Workspace::default();
+    let mut workspace = Workspace::demo_fixture();
     let id = workspace.open(ToolKind::Information, TargetMode::Follow);
     workspace.resources[0].profiles[0].credential_ref = Some("SECRET_REF".into());
     workspace.resources[0].profiles[0].auth = AuthMethod::PrivateKey {
@@ -27,7 +27,7 @@ fn context_capture_excludes_secrets_and_does_not_follow_later_edits() {
 
 #[test]
 fn denied_host_calls_do_not_run_and_grants_are_per_instance() {
-    let mut workspace = Workspace::default();
+    let mut workspace = Workspace::demo_fixture();
     let id = workspace.open(ToolKind::Information, TargetMode::Follow);
     let denied = ToolProvider::plugin("denied", ResourceCapabilities::default())
         .instantiate(id, &workspace)
@@ -42,7 +42,7 @@ fn denied_host_calls_do_not_run_and_grants_are_per_instance() {
 
 #[test]
 fn unload_revokes_old_handles_and_drops_subscriptions_and_tasks_once() {
-    let mut workspace = Workspace::default();
+    let mut workspace = Workspace::demo_fixture();
     let id = workspace.open(ToolKind::Information, TargetMode::Follow);
     let mut instance = ToolProvider::plugin("example", ResourceCapabilities::metadata())
         .instantiate(id, &workspace)
@@ -64,7 +64,7 @@ fn unload_revokes_old_handles_and_drops_subscriptions_and_tasks_once() {
 
 #[test]
 fn native_profiles_stay_inside_builtin_boundary_and_cli_metadata_stays_private() {
-    let mut workspace = Workspace::default();
+    let mut workspace = Workspace::demo_fixture();
     let id = workspace.open(ToolKind::Sftp, TargetMode::Follow);
     workspace.resources[0].profiles[0].ephemeral = true;
     workspace.resources[0].profiles[0].credential_ref = Some("native-only".into());
@@ -104,7 +104,7 @@ fn native_profiles_stay_inside_builtin_boundary_and_cli_metadata_stays_private()
 #[test]
 fn enabled_plugin_and_dock_placement_restore_through_sqlite() {
     use crate::{settings::Settings, workspace::Location};
-    let mut settings = Settings::default();
+    let mut settings = Settings::demo_fixture();
     let id = settings
         .workspace
         .open(ToolKind::Plugin, TargetMode::Fixed(2));
@@ -129,7 +129,7 @@ fn enabled_plugin_and_dock_placement_restore_through_sqlite() {
 
 #[test]
 fn ephemeral_view_identity_is_refused_before_plugin_instantiation() {
-    let mut workspace = Workspace::default();
+    let mut workspace = Workspace::demo_fixture();
     let id = workspace.open(ToolKind::Plugin, TargetMode::Follow);
     workspace.views[0].ephemeral = true;
     assert!(
@@ -142,7 +142,7 @@ fn ephemeral_view_identity_is_refused_before_plugin_instantiation() {
 
 #[test]
 fn collection_activity_pauses_metadata_without_revoking_user_job_lease() {
-    let mut workspace = crate::workspace::Workspace::default();
+    let mut workspace = crate::workspace::Workspace::demo_fixture();
     let id = workspace.open(
         crate::workspace::ToolKind::Plugin,
         crate::workspace::TargetMode::Follow,
