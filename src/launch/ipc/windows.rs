@@ -110,7 +110,7 @@ fn pipe(name: &str, sid: &str, first: bool) -> io::Result<NamedPipeServer> {
         let result = ServerOptions::new()
             .first_pipe_instance(first)
             .reject_remote_clients(true)
-            .max_instances((QUEUE_CAPACITY + 1) as u32)
+            .max_instances(QUEUE_CAPACITY + 1)
             .create_with_security_attributes_raw(
                 name,
                 (&attributes as *const SECURITY_ATTRIBUTES)
@@ -151,32 +151,52 @@ pub(super) fn start(
     let (sid, name) = identity().map_err(|_| failure())?;
     let _entered = crate::tasks::runtime().enter();
     let first = pipe(&name, &sid, true).map_err(|_| failure())?;
-    let task = crate::tasks::runtime().spawn(async move {
-        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_CAPACITY));
-        let mut current = first;
-        loop {
-            if current.connect().await.is_err() {
-                break;
-            }
-            let next = pipe(&name, &sid, false);
-            let queue = queue.clone();
-            let slot = slots.clone().try_acquire_owned();
-            let mut connected = current;
-            tokio::spawn(async move {
-                if let Ok(_slot) = slot {
-                    let _ = tokio::time::timeout(DEADLINE, receive(&mut connected, &queue)).await;
-                }
-            });
-            match next {
-                Ok(p) => current = p,
-                Err(_) => break,
-            }
-        }
-    });
+    let task = serve(first, name, sid, queue);
     Ok(Server {
         requests,
         sender,
         task,
+    })
+}
+fn serve(
+    first: NamedPipeServer,
+    name: String,
+    sid: String,
+    queue: SyncSender<OpenRequest>,
+) -> tokio::task::JoinHandle<()> {
+    crate::tasks::runtime().spawn(async move {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(QUEUE_CAPACITY));
+        let mut current = first;
+        loop {
+            // Reserve before accepting: 32 active handles plus this listener are
+            // the entire 33-instance budget. Saturation never creates a 34th.
+            let Ok(slot) = admission::reserve(&slots).await else {
+                break;
+            };
+            if current.connect().await.is_err() {
+                let _ = current.disconnect();
+                drop(slot);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            let next = match pipe(&name, &sid, false) {
+                Ok(next) => next,
+                Err(_) => {
+                    // Keep the owned instance as the listener if replacement
+                    // creation fails. A transient OS limit must not kill IPC.
+                    let _ = current.disconnect();
+                    drop(slot);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+            };
+            let mut connected = std::mem::replace(&mut current, next);
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(DEADLINE, receive(&mut connected, &queue)).await;
+                admission::release(connected, slot);
+            });
+        }
     })
 }
 #[cfg(test)]
@@ -207,6 +227,56 @@ mod tests {
             }
             assert_eq!(opened, 1);
             assert_eq!(timedout, 7);
+        });
+    }
+    #[test]
+    fn full_transaction_set_keeps_primary_listener_alive() {
+        let (sid, name) = identity().unwrap();
+        let name = format!("{name}-saturation-{}", std::process::id());
+        let (queue, requests) = sync_channel(QUEUE_CAPACITY);
+        crate::tasks::runtime().block_on(async {
+            let first = pipe(&name, &sid, true).unwrap();
+            let task = serve(first, name.clone(), sid.clone(), queue);
+            let mut held = vec![];
+            for _ in 0..QUEUE_CAPACITY + 1 {
+                held.push(
+                    retry::open_until(std::time::Instant::now() + DEADLINE, || {
+                        ClientOptions::new().open(&name)
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                );
+            }
+            // All transaction slots and the extra owned listener are held. More
+            // clients time out; they cannot terminate the primary accept loop.
+            for _ in 0..4 {
+                let result = retry::open_until(
+                    std::time::Instant::now() + Duration::from_millis(30),
+                    || ClientOptions::new().open(&name),
+                )
+                .await;
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            }
+            assert!(!task.is_finished());
+            drop(held);
+            let mut client = retry::open_until(std::time::Instant::now() + DEADLINE, || {
+                ClientOptions::new().open(&name)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            verify_server(&client, &sid).unwrap();
+            tokio::time::timeout(DEADLINE, write_request(&mut client, &OpenRequest::focus()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                requests.try_recv().unwrap().target,
+                super::super::super::Target::Focus
+            ));
+            assert!(!task.is_finished());
+            task.abort();
         });
     }
 }

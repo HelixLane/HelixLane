@@ -1,4 +1,4 @@
-fn main() {
+fn main() -> std::process::ExitCode {
     if let Err(error) = helixlane::launch::run_proxy(
         helixlane::launch::parse_putty,
         helixlane::launch::PUTTY_HELP,
@@ -7,6 +7,7 @@ fn main() {
             "HelixLane launcher: {}",
             helixlane::launch::diagnostic(&error)
         );
-        std::process::exit(2);
+        return std::process::ExitCode::from(2);
     }
+    std::process::ExitCode::SUCCESS
 }

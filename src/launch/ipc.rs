@@ -7,6 +7,8 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
+#[cfg(any(windows, test))]
+mod admission;
 pub mod retry;
 #[cfg(windows)]
 mod windows;

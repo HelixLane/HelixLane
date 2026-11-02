@@ -1,6 +1,9 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
-fn decode_text(raw: &str) -> Result<String, String> {
+fn validate_encoding(raw: &str) -> Result<(), String> {
+    if !valid_text(raw) {
+        return Err(invalid());
+    }
     let bytes = raw.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -16,28 +19,81 @@ fn decode_text(raw: &str) -> Result<String, String> {
             i += 1;
         }
     }
-    let text = percent_encoding::percent_decode_str(raw)
-        .decode_utf8()
-        .map_err(|_| invalid())?
-        .into_owned();
-    if !valid_text(&text) {
+    Ok(())
+}
+fn decode_bytes(raw: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+    validate_encoding(raw)?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(raw.len()));
+    let raw = raw.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' {
+            let high = (raw[i + 1] as char).to_digit(16).ok_or_else(invalid)?;
+            let low = (raw[i + 2] as char).to_digit(16).ok_or_else(invalid)?;
+            bytes.push(((high << 4) | low) as u8);
+            i += 3;
+        } else {
+            bytes.push(raw[i]);
+            i += 1;
+        }
+    }
+    Ok(bytes)
+}
+fn decode_text(raw: &str) -> Result<String, String> {
+    let bytes = decode_bytes(raw)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+    if !valid_text(text) {
         return Err(invalid());
     }
-    Ok(text)
+    Ok(text.into())
+}
+fn decode_secret(raw: &str) -> Result<Secret, String> {
+    let bytes = decode_bytes(raw)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+    if !valid_text(text) {
+        return Err(invalid());
+    }
+    Ok(Secret::new(text.into()))
+}
+fn decode_form(raw: &str) -> Result<String, String> {
+    decode_text(&raw.replace('+', " "))
 }
 fn connection_url(raw: &str, legacy: bool) -> Result<OpenRequest, String> {
-    decode_text(raw)?;
-    let u = url::Url::parse(raw).map_err(|_| invalid())?;
-    let protocol = match u.scheme() {
+    // Never allocate a decoded full URL or hand credential-bearing text to Url.
+    validate_encoding(raw)?;
+    let (scheme, tail) = raw.split_once("://").ok_or_else(invalid)?;
+    let protocol = match scheme {
         "ssh" if !legacy => Protocol::Ssh,
         "sftp" => Protocol::Sftp,
         _ => return Err(invalid()),
     };
-    if u.query().is_some() || u.fragment().is_some() || (!legacy && u.password().is_some()) {
-        return Err("Connection URL contains unsupported or forbidden fields / 连接 URL 不允许包含密码或额外字段".into());
+    let split = tail.find(['/', '?', '#']).unwrap_or(tail.len());
+    let (authority, suffix) = tail.split_at(split);
+    if suffix.contains(['?', '#']) {
+        return Err(invalid());
     }
-    let username = decode_text(u.username())?;
-    let password = u.password().map(decode_text).transpose()?;
+    let (userinfo, host) = authority
+        .rsplit_once('@')
+        .map(|(u, h)| (Some(u), h))
+        .unwrap_or((None, authority));
+    let (username, password) = if let Some(info) = userinfo {
+        if info.contains('@') {
+            return Err(invalid());
+        }
+        match info.split_once(':') {
+            Some((user, password)) => {
+                if !legacy {
+                    return Err("Connection URL contains unsupported or forbidden fields / 连接 URL 不允许包含密码或额外字段".into());
+                }
+                (decode_text(user)?, Some(decode_secret(password)?))
+            }
+            None => (decode_text(info)?, None),
+        }
+    } else {
+        (String::new(), None)
+    };
+    let sanitized = format!("{scheme}://{host}{suffix}");
+    let u = url::Url::parse(&sanitized).map_err(|_| invalid())?;
     let r = OpenRequest {
         target: Target::Connection(Connection {
             host: u
@@ -58,37 +114,33 @@ fn connection_url(raw: &str, legacy: bool) -> Result<OpenRequest, String> {
             Some(decode_text(u.path())?)
         },
         name: None,
-        secret: password.map(Secret::new),
+        secret: password,
     };
     r.validate()?;
     Ok(r)
 }
 fn own_uri(raw: &str) -> Result<OpenRequest, String> {
-    decode_text(raw)?;
-    let u = url::Url::parse(raw).map_err(|_| invalid())?;
-    if u.scheme() != "helixlane"
-        || u.host_str() != Some("open")
-        || !u.username().is_empty()
-        || u.password().is_some()
-        || u.port().is_some()
-        || u.fragment().is_some()
-        || !matches!(u.path(), "" | "/")
+    validate_encoding(raw)?;
+    let (stem, query) = raw.split_once('?').ok_or_else(invalid)?;
+    if !(stem.eq_ignore_ascii_case("helixlane://open")
+        || stem.eq_ignore_ascii_case("helixlane://open/"))
+        || query.contains('#')
     {
         return Err(invalid());
     }
     let mut fields = HashMap::new();
-    for item in u.query().ok_or_else(invalid)?.split('&') {
+    for item in query.split('&') {
         let (key, value) = item.split_once('=').ok_or_else(invalid)?;
-        let key = decode_text(key)?;
-        let value = decode_text(value)?;
+        let key = decode_form(key)?;
         if ![
             "protocol", "host", "user", "port", "path", "name", "mode", "resource",
         ]
         .contains(&key.as_str())
-            || fields.insert(key, value).is_some()
+            || fields.contains_key(&key)
         {
             return Err(invalid());
         }
+        fields.insert(key, decode_form(value)?);
     }
     let protocol = match fields.get("protocol").map(String::as_str) {
         None | Some("ssh") => Protocol::Ssh,
@@ -170,6 +222,7 @@ pub fn parse_native(args: &[String]) -> Result<Entry, String> {
     let mut target = None;
     let mut opts = HashMap::new();
     let mut seen = HashSet::new();
+    let mut auth_none = false;
     let mut i = 1;
     while i < args.len() {
         let key = args[i].as_str();
@@ -204,7 +257,7 @@ pub fn parse_native(args: &[String]) -> Result<Entry, String> {
                     "--activate" => r.mode = OpenMode::Activate,
                     "--new-view" => r.mode = OpenMode::NewView,
                     "--new-window" => r.mode = OpenMode::NewWindow,
-                    "--auth-none" => {}
+                    "--auth-none" => auth_none = true,
                     _ => return Err(invalid()),
                 }
             }
@@ -246,7 +299,7 @@ pub fn parse_native(args: &[String]) -> Result<Entry, String> {
                 path: (*path).into(),
             };
         }
-        if args.iter().any(|s| s == "--auth-none") {
+        if auth_none {
             c.auth = AuthMethod::None;
         }
     }
@@ -261,7 +314,7 @@ pub fn parse_putty(args: &[String]) -> Result<Entry, String> {
     if args.len() == 1 && ["--help", "--version"].contains(&args[0].as_str()) {
         return parse_native(args);
     }
-    let mut native = vec!["open".to_string()];
+    let mut native = Zeroizing::new(vec!["open".to_string()]);
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {

@@ -54,6 +54,103 @@ struct State {
     delete: bool,
     remote_active: bool,
 }
+// A launch navigates the real browser and retires every older path operation.
+fn request_remote_path(state: &Arc<Mutex<State>>, path: String) {
+    let mut s = state.lock().unwrap();
+    s.generation += 1;
+    s.remote.navigate(path);
+    s.canonical_path_pending = None;
+    s.busy = false;
+    s.attempted = None;
+    s.error = None;
+    s.delete = false;
+    s.pending = None;
+    s.remote_active = true;
+    drop(s);
+    refresh_state(state, true);
+}
+struct InitialListing {
+    generation: u64,
+    path: String,
+    revision: u64,
+}
+fn begin_initial_listing(s: &mut State) -> InitialListing {
+    s.busy = true;
+    s.attempted = s.session_id;
+    InitialListing {
+        generation: s.generation,
+        path: s.remote.path.clone(),
+        revision: s.remote.refresh_ticket(),
+    }
+}
+fn finish_initial_listing(
+    s: &mut State,
+    ticket: InitialListing,
+    result: Result<(Endpoint, Vec<helixlane::sftp::Entry>, String), String>,
+) {
+    if s.generation != ticket.generation
+        || s.remote.path != ticket.path
+        || !s.remote.accepts(ticket.revision)
+    {
+        return;
+    }
+    s.busy = false;
+    match result {
+        Ok((e, entries, path)) => {
+            s.remote.path = path.clone();
+            s.canonical_path_pending = Some(path);
+            s.endpoint = Some(e);
+            s.remote.entries = entries;
+            s.notice = None;
+        }
+        Err(e) => s.error = Some(e),
+    }
+}
+fn refresh_state(state: &Arc<Mutex<State>>, remote: bool) {
+    let (endpoint, path, generation, ticket) = {
+        let mut s = state.lock().unwrap();
+        let endpoint = if remote {
+            let Some(e) = s.endpoint.clone() else {
+                s.attempted = None;
+                return;
+            };
+            e
+        } else {
+            Endpoint::Local
+        };
+        let ticket = if remote {
+            s.remote.refresh_ticket()
+        } else {
+            s.local.refresh_ticket()
+        };
+        (
+            endpoint,
+            if remote {
+                s.remote.path.clone()
+            } else {
+                s.local.path.clone()
+            },
+            s.generation,
+            ticket,
+        )
+    };
+    let state = state.clone();
+    tasks::runtime().spawn(async move {
+        let result = endpoint.list(&path).await;
+        let mut s = state.lock().unwrap();
+        if s.generation != generation {
+            return;
+        }
+        let browser = if remote { &mut s.remote } else { &mut s.local };
+        if browser.path != path || !browser.accepts(ticket) {
+            return;
+        }
+        match result {
+            Ok(entries) => browser.entries = entries,
+            Err(e) => s.error = Some(e),
+        }
+    });
+}
 fn file_views() -> &'static Mutex<std::collections::BTreeMap<u64, std::sync::Weak<Mutex<State>>>> {
     static VIEWS: std::sync::OnceLock<
         Mutex<std::collections::BTreeMap<u64, std::sync::Weak<Mutex<State>>>>,
@@ -205,13 +302,8 @@ impl FilePane {
         cx: &mut Context<Self>,
     ) {
         if let Some(path) = request.remote_path {
-            if self.state.lock().unwrap().endpoint.is_some() {
-                self.set_path(true, path, window, cx);
-            } else {
-                self.state.lock().unwrap().remote = Browser::remote(path.clone());
-                self.remote_path
-                    .update(cx, |s, cx| s.set_value(path, window, cx));
-            }
+            request_remote_path(&self.state, path.clone());
+            self.set_path(true, path, window, cx);
         }
         self.auth
             .update(cx, |auth, cx| auth.launch(request.secret, window, cx));
@@ -246,6 +338,7 @@ impl FilePane {
         let mut s = self.state.lock().unwrap();
         s.generation += 1;
         s.endpoint = None;
+        s.canonical_path_pending = None;
         s.session_id = None;
         s.attempted = None;
         let path = if preserve_path {
@@ -304,82 +397,23 @@ impl FilePane {
             && s.attempted != selected_id
             && let Some(session) = session
         {
-            s.busy = true;
-            s.attempted = selected_id;
-            let generation = s.generation;
+            let ticket = begin_initial_listing(&mut s);
             let state = self.state.clone();
-            let initial_remote_path = s.remote.path.clone();
             drop(s);
             tasks::runtime().spawn(async move {
                 let result = async {
                     let endpoint = Endpoint::connect(session).await?;
-                    let path = endpoint.canonicalize(&initial_remote_path).await?;
+                    let path = endpoint.canonicalize(&ticket.path).await?;
                     let entries = endpoint.list(&path).await?;
                     Ok::<_, String>((endpoint, entries, path))
                 }
                 .await;
-                let mut s = state.lock().unwrap();
-                if s.generation != generation {
-                    return;
-                }
-                s.busy = false;
-                match result {
-                    Ok((e, entries, path)) => {
-                        s.remote.path = path.clone();
-                        s.canonical_path_pending = Some(path);
-                        s.endpoint = Some(e);
-                        s.remote.entries = entries;
-                        s.notice = None;
-                    }
-                    Err(e) => s.error = Some(e),
-                }
+                finish_initial_listing(&mut state.lock().unwrap(), ticket, result);
             });
         }
     }
     fn refresh(&self, remote: bool) {
-        let (endpoint, path, generation, ticket) = {
-            let mut s = self.state.lock().unwrap();
-            let endpoint = if remote {
-                let Some(e) = s.endpoint.clone() else {
-                    s.attempted = None;
-                    return;
-                };
-                e
-            } else {
-                Endpoint::Local
-            };
-            let ticket = if remote {
-                s.remote.refresh_ticket()
-            } else {
-                s.local.refresh_ticket()
-            };
-            (
-                endpoint,
-                if remote {
-                    s.remote.path.clone()
-                } else {
-                    s.local.path.clone()
-                },
-                s.generation,
-                ticket,
-            )
-        };
-        let state = self.state.clone();
-        tasks::runtime().spawn(async move {
-            let result = endpoint.list(&path).await;
-            let mut s = state.lock().unwrap();
-            if s.generation != generation {
-                return;
-            }
-            let browser = if remote { &mut s.remote } else { &mut s.local };
-            if browser.path != path || !browser.accepts(ticket) {
-                return;
-            }
-            match result {
-                Ok(entries) => browser.entries = entries,
-                Err(e) => s.error = Some(e),
-            }
-        });
+        refresh_state(&self.state, remote);
     }
     fn transfer(&self, upload: bool) {
         let state = self.state.clone();
@@ -942,6 +976,11 @@ impl FilePane {
         if path.is_empty() || path.contains('\0') {
             self.state.lock().unwrap().error = Some("Invalid path".into());
             cx.notify();
+            return;
+        }
+        if remote {
+            request_remote_path(&self.state, path.clone());
+            self.set_path(true, path, w, cx);
             return;
         }
         let mut state = self.state.lock().unwrap();
@@ -1625,5 +1664,105 @@ impl Render for TransfersPane {
         content
             .child(div().flex_1().min_h_0().child(transfers(language, cx)))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod launch_path_tests {
+    use super::*;
+    fn state(path: String, endpoint: Option<Endpoint>) -> Arc<Mutex<State>> {
+        Arc::new(Mutex::new(State {
+            generation: 0,
+            session_id: Some(1),
+            attempted: None,
+            form: None,
+            pending: None,
+            canonical_path_pending: None,
+            endpoint,
+            local: Browser::new(".".into()),
+            remote: Browser::remote(path),
+            busy: false,
+            error: None,
+            notice: None,
+            conflict: Conflict::Rename,
+            delete: false,
+            remote_active: false,
+        }))
+    }
+    fn dirs(name: &str) -> (std::path::PathBuf, String, String) {
+        let root = std::env::temp_dir().join(format!("helix-pane-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("A")).unwrap();
+        std::fs::create_dir(root.join("B")).unwrap();
+        std::fs::write(root.join("A/A.txt"), b"A").unwrap();
+        std::fs::write(root.join("B/B.txt"), b"B").unwrap();
+        (
+            root.clone(),
+            root.join("A").display().to_string(),
+            root.join("B").display().to_string(),
+        )
+    }
+    #[::core::prelude::v1::test]
+    fn connected_launch_navigates_browser_and_real_entries() {
+        let (root, a, b) = dirs("connected");
+        let state = state(a.clone(), Some(Endpoint::Local));
+        tasks::runtime().block_on(async {
+            state.lock().unwrap().remote.entries = Endpoint::Local.list(&a).await.unwrap();
+        });
+        request_remote_path(&state, b.clone());
+        tasks::runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let ready = {
+                        let s = state.lock().unwrap();
+                        s.remote.path == b
+                            && s.remote.entries.iter().any(|entry| entry.name == "B.txt")
+                    };
+                    if ready {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let s = state.lock().unwrap();
+        assert_eq!(s.remote.path, b);
+        assert!(!s.remote.entries.iter().any(|entry| entry.name == "A.txt"));
+        drop(s);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[::core::prelude::v1::test]
+    fn newer_path_invalidates_in_flight_initial_listing() {
+        let (root, a, b) = dirs("initial");
+        let state = state(a.clone(), None);
+        let generation = begin_initial_listing(&mut state.lock().unwrap());
+        let old_entries = tasks::runtime().block_on(Endpoint::Local.list(&a)).unwrap();
+        request_remote_path(&state, b.clone());
+        finish_initial_listing(
+            &mut state.lock().unwrap(),
+            generation,
+            Ok((Endpoint::Local, old_entries, a)),
+        );
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.remote.path, b);
+            assert!(s.endpoint.is_none());
+            assert!(s.attempted.is_none());
+            assert!(!s.busy);
+        }
+        let entries = tasks::runtime().block_on(Endpoint::Local.list(&b)).unwrap();
+        let latest = begin_initial_listing(&mut state.lock().unwrap());
+        finish_initial_listing(
+            &mut state.lock().unwrap(),
+            latest,
+            Ok((Endpoint::Local, entries, b.clone())),
+        );
+        let s = state.lock().unwrap();
+        assert_eq!(s.remote.path, b);
+        assert_eq!(s.remote.entries[0].name, "B.txt");
+        drop(s);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

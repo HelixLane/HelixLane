@@ -4,7 +4,7 @@ use crate::{
     workspace::{AuthMethod, ConnectionProfile, Resource, TargetMode, ToolKind, Workspace},
 };
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 pub mod ipc;
 mod parser;
 pub use parser::{parse_native, parse_putty, parse_winscp};
@@ -272,14 +272,7 @@ struct Wire {
     mode: OpenMode,
     remote_path: Option<String>,
     name: Option<String>,
-    password: Option<String>,
-}
-impl Drop for Wire {
-    fn drop(&mut self) {
-        if let Some(p) = &mut self.password {
-            p.zeroize()
-        }
-    }
+    password: Option<Secret>,
 }
 pub fn encode(r: &OpenRequest) -> Result<Zeroizing<Vec<u8>>, String> {
     r.validate()?;
@@ -314,20 +307,28 @@ pub fn decode(bytes: &[u8]) -> Result<OpenRequest, String> {
         mode: w.mode,
         remote_path: w.remote_path.take(),
         name: w.name.take(),
-        secret: w.password.take().map(Secret::new),
+        secret: w.password.take(),
     };
     r.validate()?;
     Ok(r)
 }
-pub fn os_arguments() -> Result<Vec<String>, String> {
-    std::env::args_os()
-        .skip(1)
-        .map(|s| s.into_string().map_err(|_| invalid()))
-        .collect()
+pub fn os_arguments() -> Result<Zeroizing<Vec<String>>, String> {
+    collect_os_arguments(std::env::args_os().skip(1))
+}
+fn collect_os_arguments(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<Zeroizing<Vec<String>>, String> {
+    let mut values = Zeroizing::new(Vec::new());
+    for arg in args {
+        let bytes = Zeroizing::new(arg.into_encoded_bytes());
+        let value = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+        values.push(value.to_owned());
+    }
+    Ok(values)
 }
 /// Launch the sibling main executable without copying credentials to child argv.
 pub fn run_proxy(parse: fn(&[String]) -> Result<Entry, String>, help: &str) -> Result<(), String> {
-    let args = Zeroizing::new(os_arguments()?);
+    let args = os_arguments()?;
     let entry = parse(&args)?;
     drop(args);
     let request = match entry {
@@ -366,4 +367,58 @@ pub fn run_proxy(parse: fn(&[String]) -> Result<Entry, String>, help: &str) -> R
         .write_all(&bytes)
         .map_err(|_| invalid())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    #[test]
+    fn partially_deserialized_password_is_already_secret_owned() {
+        for bytes in [
+            br#"{"password":"private-canary","unknown":true}"#.as_slice(),
+            br#"{"password":"private-canary","password":"duplicate"}"#.as_slice(),
+            br#"{"password":"private-canary","version":"#.as_slice(),
+        ] {
+            let before = Secret::test_drop_count();
+            let error = decode(bytes).unwrap_err();
+            assert!(!error.contains("private-canary"));
+            assert_eq!(
+                Secret::test_drop_count(),
+                before + 1,
+                "parsed password must acquire zeroizing ownership before later fields fail"
+            );
+        }
+    }
+    #[test]
+    fn parsed_legacy_password_is_dropped_when_a_later_url_field_fails() {
+        for url in [
+            "sftp://alice:private-canary@host/%00",
+            "sftp://alice:private-canary@bad host/a",
+        ] {
+            let before = Secret::test_drop_count();
+            let error = parse_winscp(&[url.into()]).unwrap_err();
+            assert!(!error.contains("private-canary"));
+            assert_eq!(Secret::test_drop_count(), before + 1);
+        }
+        let error = parse_putty(&["-pw".into(), "private-canary".into(), "-unsupported".into()])
+            .unwrap_err();
+        assert!(!error.contains("private-canary"));
+    }
+    #[test]
+    fn os_argument_collection_is_protected_before_unicode_validation() {
+        let protected: Zeroizing<Vec<String>> =
+            collect_os_arguments([std::ffi::OsString::from("private-canary")]).unwrap();
+        assert_eq!(protected[0], "private-canary");
+        drop(protected);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let error = collect_os_arguments([
+                std::ffi::OsString::from("private-canary"),
+                std::ffi::OsString::from_vec(vec![255]),
+            ])
+            .unwrap_err();
+            assert!(!error.contains("private-canary"));
+        }
+    }
 }

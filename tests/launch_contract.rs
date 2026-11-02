@@ -308,3 +308,56 @@ fn saved_resource_new_view_remains_persistent() {
     );
     assert_eq!(snapshot.workspace.resources[0], resource);
 }
+#[test]
+fn consumed_auth_none_values_never_select_an_auth_method() {
+    use helixlane::workspace::AuthMethod;
+    for flag in ["--password", "--name", "--path"] {
+        let request = open(&["open", "alice@host", flag, "--auth-none"]);
+        assert_eq!(request.connection().unwrap().auth, AuthMethod::Password);
+        match flag {
+            "--password" => assert_eq!(request.secret.unwrap().expose(), "--auth-none"),
+            "--name" => assert_eq!(request.name.as_deref(), Some("--auth-none")),
+            _ => assert_eq!(request.remote_path.as_deref(), Some("--auth-none")),
+        }
+    }
+    let Entry::Open(proxy) = parse_putty(&args(&["-pw", "--auth-none", "alice@host"])).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(proxy.secret.unwrap().expose(), "--auth-none");
+    assert!(matches!(
+        open(&["open", "alice@host", "--auth-none"])
+            .connection()
+            .unwrap()
+            .auth,
+        AuthMethod::None
+    ));
+    for flags in [
+        vec!["open", "alice@host", "--auth-none", "--auth-none"],
+        vec!["open", "alice@host", "--password", "value", "--auth-none"],
+    ] {
+        assert!(parse_native(&args(&flags)).is_err());
+    }
+}
+#[test]
+fn own_uri_form_query_decodes_space_and_literal_plus_distinctly() {
+    let spaced =
+        open(&["helixlane://open?host=host&path=%2Finitial+path&name=Space+Name&user=alice"]);
+    assert_eq!(spaced.remote_path.as_deref(), Some("/initial path"));
+    assert_eq!(spaced.name.as_deref(), Some("Space Name"));
+    assert_eq!(
+        open(&["helixlane://open?host=host&path=%2Fa%2Bb"])
+            .remote_path
+            .as_deref(),
+        Some("/a+b")
+    );
+    for uri in [
+        "helixlane://open?host=host&path=%FF+bad",
+        "helixlane://open?host=host&path=%00+bad",
+        "helixlane://open?host=host&password=private+canary",
+        "helixlane://open?host=host&path=a+b&path=c",
+    ] {
+        let error = parse_native(&args(&[uri])).unwrap_err();
+        assert!(!error.contains("private"));
+    }
+}

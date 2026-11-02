@@ -10,19 +10,19 @@ use gpui_kit::*;
 
 actions!(helixlane, [Quit]);
 
-fn main() {
-    let args = zeroize::Zeroizing::new(match helixlane::launch::os_arguments() {
+fn main() -> std::process::ExitCode {
+    let args = match helixlane::launch::os_arguments() {
         Ok(args) => args,
         Err(error) => {
             eprintln!("HelixLane: {error}");
-            std::process::exit(2);
+            return std::process::ExitCode::from(2);
         }
-    });
+    };
     let entry = match helixlane::launch::parse_native(&args) {
         Ok(e) => e,
         Err(error) => {
             eprintln!("HelixLane: {error}");
-            std::process::exit(2);
+            return std::process::ExitCode::from(2);
         }
     };
     drop(args);
@@ -30,11 +30,11 @@ fn main() {
     let request = match entry {
         Entry::Help => {
             print!("{}", helixlane::launch::HELP);
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
         Entry::Version => {
             println!("HelixLane {}", env!("CARGO_PKG_VERSION"));
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
         Entry::Open(r) => Some(r),
         Entry::Gui => Some(helixlane::launch::OpenRequest::focus()),
@@ -47,13 +47,13 @@ fn main() {
                 .is_err()
             {
                 eprintln!("HelixLane: Unable to read launch request / 无法读取启动请求");
-                std::process::exit(2);
+                return std::process::ExitCode::from(2);
             }
             match helixlane::launch::decode(&bytes) {
                 Ok(r) => Some(r),
                 Err(error) => {
                     eprintln!("HelixLane: {error}");
-                    std::process::exit(2);
+                    return std::process::ExitCode::from(2);
                 }
             }
         }
@@ -61,11 +61,11 @@ fn main() {
     // Every entry path shares the protected primary-instance channel.
     if let Some(r) = &request {
         match helixlane::launch::ipc::forward(r) {
-            Ok(true) => return,
+            Ok(true) => return std::process::ExitCode::SUCCESS,
             Ok(false) => {}
             Err(error) => {
                 eprintln!("HelixLane: {error}");
-                std::process::exit(2);
+                return std::process::ExitCode::from(2);
             }
         }
     }
@@ -76,14 +76,14 @@ fn main() {
             if let Some(request) = &request {
                 while std::time::Instant::now() < deadline {
                     match helixlane::launch::ipc::forward(request) {
-                        Ok(true) => return,
+                        Ok(true) => return std::process::ExitCode::SUCCESS,
                         Ok(false) => std::thread::sleep(std::time::Duration::from_millis(25)),
                         Err(_) => break,
                     }
                 }
             }
             eprintln!("HelixLane: {error}");
-            std::process::exit(2);
+            return std::process::ExitCode::from(2);
         }
     };
     let urls = server.sender();
@@ -147,4 +147,5 @@ fn main() {
         .expect("Failed to open the HelixLane desktop window");
         cx.activate(true);
     });
+    std::process::ExitCode::SUCCESS
 }
